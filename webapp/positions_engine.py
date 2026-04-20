@@ -74,23 +74,26 @@ def calculate_stops(
 ) -> tuple[float, float]:
     """基于 ATR 的动态止损止盈.
 
-    规则:
-        止损 = cost - ATR × 2  (或成本 -5%, 取更严的)
-        止盈 = cost + ATR × 4  (或成本 +8%, 取更宽的)
+    核心规则 (止损宽度):
+        sl_width = max(min_stop_loss_pct × cost, ATR × N)
+        止损 = cost - sl_width
 
-    为什么不用固定 %:
-        高波动股用 2% 止损会被随机波动打掉
-        低波动股用 5% 止损又太宽松
-        ATR 动态适应每只股的脾气
+    解读:
+        - 低波动股 (ATR 小): min_pct 兜底, 避免微小波动打掉止损
+        - 高波动股 (ATR 大): 放宽到 ATR × N, 避免正常波动过早止损
+        即 ATR 只决定 "至少多宽", 不决定 "至多多紧"
+
+    对比天真 5%:
+        长江电力 日波动 0.8% → 5% 止损宽松合理
+        寒武纪  日波动 4%   → 5% 止损太紧 (一天就打掉)
+                              → ATR × 2 放宽到 ~8% 更合理
     """
-    ref = cost_price  # 以成本价锚定, 不追高
-    sl_atr = ref - atr * atr_multiplier_sl
-    sl_pct = ref * (1 - min_stop_loss_pct)
-    stop_loss = max(sl_atr, sl_pct)   # 取更近的 (更严)
+    ref = cost_price
+    sl_width = max(min_stop_loss_pct * ref, atr * atr_multiplier_sl)
+    stop_loss = ref - sl_width
 
-    tp_atr = ref + atr * atr_multiplier_tp
-    tp_pct = ref * (1 + min_take_profit_pct)
-    take_profit = max(tp_atr, tp_pct)  # 取更远的 (赚得多)
+    tp_width = max(min_take_profit_pct * ref, atr * atr_multiplier_tp)
+    take_profit = ref + tp_width
 
     return round(stop_loss, 2), round(take_profit, 2)
 

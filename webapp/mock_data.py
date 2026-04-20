@@ -27,6 +27,7 @@ def get_market_regime() -> dict:
             "赚钱效应温, 58% 个股上涨",
             "两市成交额 11200 亿, 流动性高",
         ],
+        "data_source": "mock",
     }
 
 

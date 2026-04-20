@@ -26,14 +26,24 @@ from .style_factors import (
     compute_all_styles,
 )
 from .neutralize import (
-    neutralize_by_regression, neutralize_one_stock,
-    industry_dummies,
+    neutralize_by_regression, neutralize_hierarchical,
+    neutralize_one_stock, industry_dummies,
+    explained_variance_by_styles, NeutralizeDiagnostics,
+)
+from .preprocess import (
+    winsorize_mad, robust_standardize, cross_section_standardize,
+    orthogonalize_factors, preprocess_factor, preprocess_factor_matrix,
+    condition_number,
 )
 
 __all__ = [
     "compute_size", "compute_beta", "compute_momentum",
     "compute_residual_volatility", "compute_liquidity",
     "compute_all_styles",
-    "neutralize_by_regression", "neutralize_one_stock",
-    "industry_dummies",
+    "neutralize_by_regression", "neutralize_hierarchical",
+    "neutralize_one_stock", "industry_dummies",
+    "explained_variance_by_styles", "NeutralizeDiagnostics",
+    "winsorize_mad", "robust_standardize", "cross_section_standardize",
+    "orthogonalize_factors", "preprocess_factor", "preprocess_factor_matrix",
+    "condition_number",
 ]

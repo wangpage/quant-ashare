@@ -139,18 +139,12 @@ class Level2NatsClient:
         """
         import nats
 
-        conn = self.cfg["connection"]
-        active = conn["active"]
-        server = conn["servers"][active]
-        urls = [server["host"], server.get("backup")]
-        urls = [u for u in urls if u and "TODO" not in u]
-        auth = conn["auth"]
-
-        if not auth.get("user") or not auth.get("password"):
-            raise RuntimeError(
-                "Level2 凭证为空: 请设置环境变量 LEVEL2_USER / LEVEL2_PASSWORD "
-                "或使用测试账号默认值"
-            )
+        # 严格校验: 占位符 / 缺字段 / URL 非法 立即抛 ConfigurationError.
+        # 不再用 "TODO" 字符串撞猜, 盘中静默跳过的坑不能再踩.
+        from .config_validator import validate_level2_config
+        validated = validate_level2_config(self.cfg)
+        urls = validated.urls
+        auth = self.cfg["connection"]["auth"]
 
         # 文档示例格式: nats://user:pass@host:port
         urls_with_auth = []

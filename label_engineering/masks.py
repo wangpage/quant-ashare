@@ -61,11 +61,22 @@ def event_window_mask(
 ) -> pd.Series:
     """把特定事件窗口的样本标记为"不可用".
 
+    ⚠️  关键: `earnings_dates` 必须传 **披露日 (disclosure_date)**,
+    不能是报告期 (report_period). 举例:
+
+        报告期 = 2024Q1 末 (2024-03-31) - **事后才知道**
+        披露日 = 2024-04-18 (实际公告) - 当日才可用
+
+    用报告期做回测 → 回测期 2024-03-31 的样本就"看到"了 2024Q1 业绩,
+    实盘不可能. 这是 A股最经典的前视偏差之一.
+
     Args:
         df: 必须含 ['code', 'date'] 列
-        earnings_dates: {code: [date strings]}, 财报披露日
-        other_events: {code: [(date, pre_days, post_days), ...]}
-            如减持公告 (-1, 2), 增发 (-3, 5)
+        earnings_dates: {code: [disclosure_date]}, **披露日字符串**
+        pre_days: 披露前 N 天屏蔽 (信息泄露风险)
+        post_days: 披露后 N 天屏蔽 (消化期)
+        other_events: {code: [(disclosure_date, pre_days, post_days), ...]}
+            如减持公告 (-1, 2), 增发 (-3, 5), 解禁 (-10, 3)
 
     Returns:
         bool Series, True = 可用
@@ -98,6 +109,114 @@ def event_window_mask(
                 mask &= ~(stock_idx & window)
 
     return mask
+
+
+def disclosure_vs_report_check(
+    report_df: pd.DataFrame,
+    report_date_col: str = "report_period",
+    disclosure_col: str = "disclosure_date",
+    max_lag_days: int = 180,
+) -> dict:
+    """检查财报/公告数据是否同时含有 "报告期" 和 "披露日".
+
+    回测期必须用披露日 (pd.disclosure_date), 否则一定前视偏差.
+    本函数返回诊断信息, 让 pipeline 发现缺失披露日时报警.
+
+    Args:
+        report_df: 财报/公告原始数据
+        report_date_col: 报告期列名
+        disclosure_col: 披露日列名
+        max_lag_days: 披露日 - 报告期 的合理上限 (A股半年报要求 2 个月内)
+    """
+    issues = []
+    if disclosure_col not in report_df.columns:
+        issues.append(
+            f"缺少披露日列 '{disclosure_col}', 回测只能用报告期 → 前视偏差!"
+        )
+        return {
+            "has_disclosure": False, "verdict": "FAIL",
+            "issues": issues,
+        }
+    if report_date_col not in report_df.columns:
+        issues.append(f"缺少报告期列 '{report_date_col}'")
+
+    df = report_df.copy()
+    df[disclosure_col] = pd.to_datetime(df[disclosure_col], errors="coerce")
+    if report_date_col in df.columns:
+        df[report_date_col] = pd.to_datetime(df[report_date_col], errors="coerce")
+        lag_days = (df[disclosure_col] - df[report_date_col]).dt.days
+        neg = int((lag_days < 0).sum())
+        too_long = int((lag_days > max_lag_days).sum())
+        if neg > 0:
+            issues.append(
+                f"{neg} 条记录披露日早于报告期 (不可能, 疑似字段错位)"
+            )
+        if too_long > 0:
+            issues.append(
+                f"{too_long} 条记录披露日滞后 > {max_lag_days} 天 (疑似补录)"
+            )
+
+    null_disc = int(df[disclosure_col].isna().sum())
+    if null_disc > 0:
+        issues.append(f"{null_disc} 条记录披露日为空")
+
+    return {
+        "has_disclosure": True,
+        "n_records": int(len(df)),
+        "null_disclosure": null_disc,
+        "issues": issues,
+        "verdict": "FAIL" if any("FAIL" in i or "不可能" in i
+                                   for i in issues) else
+                   ("WARN" if issues else "PASS"),
+    }
+
+
+def timestamp_integrity_check(
+    feature_df: pd.DataFrame, label_df: pd.DataFrame,
+    code_col: str = "code", date_col: str = "date",
+) -> dict:
+    """检查 feature 时戳 <= label 决策时戳.
+
+    A股典型前视偏差:
+        1) label = close[t+5]/open[t+1], 但 feature 用到 close[t+1], close[t+2] ...
+        2) 跨日因子用 "昨收" 时误用了 "今开"
+        3) 盘后资金流 (如北向、龙虎榜) 用在盘中
+
+    本函数从 feature_df / label_df 的 date 列对齐, 逐票检查是否有
+    feature_date > label_anchor_date 的异常行.
+
+    Returns:
+        dict: 诊断结果, verdict ∈ {PASS, WARN, FAIL}
+    """
+    issues = []
+    if date_col not in feature_df.columns or date_col not in label_df.columns:
+        return {"verdict": "SKIP", "reason": f"缺 {date_col} 列"}
+    try:
+        fd = pd.to_datetime(feature_df[date_col])
+        ld = pd.to_datetime(label_df[date_col])
+    except Exception as e:
+        return {"verdict": "FAIL", "reason": str(e)}
+
+    future_f = int((fd > pd.Timestamp.today().normalize()).sum())
+    future_l = int((ld > pd.Timestamp.today().normalize()).sum())
+    if future_f > 0:
+        issues.append(f"feature 有 {future_f} 行在未来")
+    if future_l > 0:
+        issues.append(f"label 有 {future_l} 行在未来")
+
+    # 粗粒度: feature 日期最大值 应该 <= label 日期最大值
+    if fd.max() > ld.max():
+        issues.append(
+            f"feature 最大日期 {fd.max().date()} > label 最大日期 {ld.max().date()}, "
+            f"feature 可能包含未来数据"
+        )
+
+    return {
+        "verdict": "FAIL" if issues else "PASS",
+        "issues": issues,
+        "feature_date_range": (str(fd.min().date()), str(fd.max().date())),
+        "label_date_range": (str(ld.min().date()), str(ld.max().date())),
+    }
 
 
 def leaky_label_detector(

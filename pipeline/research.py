@@ -1,14 +1,20 @@
 """研究 Pipeline: 把所有研究期暗门串成一键流程.
 
 阶段:
-    1. 数据体检 (data_hygiene)          失败 → 中止
-    2. 标签工程 (label_engineering)      多 horizon + vol 归一化
-    3. 不可交易样本屏蔽 (masks + event) 涨跌停 + 财报 + 解禁 剔除
-    4. Barra 中性化 (barra_neutralize)  去风格 beta
-    5. 训练 LightGBM                    (可选, 需 qlib / sklearn)
-    6. IC 评估 + 衰减监控 (alpha_decay)
-    7. 回测 (execution.simulator) 带冲击成本
-    8. 产出报告 (reporting)
+    1. 数据体检 (data_hygiene)           失败 → 中止
+    2. 标签工程 (label_engineering)       多 horizon + vol 归一化
+    3. 不可交易样本屏蔽 (masks + event)   涨跌停 + 财报披露日 + 解禁
+    4. 特征生成 / 外部输入
+    5. 前视偏差扫描 (lookahead)            CRITICAL → 中止; HIGH → warning
+    6. Barra 中性化 (分层 + 岭回归)
+    7. IC 评估 + 衰减监控 (alpha_decay)
+    8. 回测 (execution.simulator + PreTradeGate 强制过闸)
+    9. 产出报告 (reporting)
+
+新增的强制环节:
+    - 第 5 步: 默认调 scan_lookahead_bias; 若 CRITICAL 且 fail_on_critical
+              为 True (默认), 中止 pipeline
+    - 第 8 步: 每次调仓过 PreTradeGate, 拒单不进组合; gate.stats 回传
 """
 from __future__ import annotations
 
@@ -30,6 +36,9 @@ class ResearchResult:
     ic_stats: dict = field(default_factory=dict)
     backtest_stats: dict = field(default_factory=dict)
     audit_report: Any = None
+    lookahead_report: dict = field(default_factory=dict)
+    neutralize_diagnostics: dict = field(default_factory=dict)
+    gate_stats: dict = field(default_factory=dict)
     warnings: list = field(default_factory=list)
     errors: list = field(default_factory=list)
 
@@ -59,12 +68,20 @@ class ResearchPipeline:
         label_horizons: list[int] | None = None,
         label_weights: list[float] | None = None,
         neutralize_styles: bool = True,
+        neutralize_method: str = "hierarchical",   # "hierarchical" | "single"
         skip_audit: bool = False,
+        lookahead_scan: bool = True,
+        fail_on_lookahead_critical: bool = True,
+        enforce_risk_gate: bool = True,
     ):
         self.label_horizons = label_horizons or [1, 3, 5, 10]
         self.label_weights = label_weights or [0.4, 0.3, 0.2, 0.1]
         self.neutralize_styles = neutralize_styles
+        self.neutralize_method = neutralize_method
         self.skip_audit = skip_audit
+        self.lookahead_scan = lookahead_scan
+        self.fail_on_lookahead_critical = fail_on_lookahead_critical
+        self.enforce_risk_gate = enforce_risk_gate
 
     def run(
         self,
@@ -98,19 +115,31 @@ class ResearchPipeline:
         # 3) 不可交易样本屏蔽
         res = self._stage_mask(daily_df, res)
 
-        # 4) 因子 (简化: 用 pct_chg 做个示例, 实际应用 qlib Alpha158)
+        # 4) 因子
         res = self._stage_features(daily_df, feature_df, res)
 
-        # 5) Barra 中性化
-        if self.neutralize_styles and market_cap is not None and market_return is not None:
+        # 5) 前视偏差扫描 (强制, 可关闭)
+        if self.lookahead_scan:
+            res = self._stage_lookahead_scan(res)
+            if (self.fail_on_lookahead_critical
+                    and res.lookahead_report.get("verdict") == "FAIL"):
+                res.errors.append(
+                    "检测到 CRITICAL 前视偏差, 中止 pipeline. "
+                    "详见 lookahead_report.suspicious_features"
+                )
+                return res
+
+        # 6) Barra 中性化
+        if (self.neutralize_styles and market_cap is not None
+                and market_return is not None):
             res = self._stage_neutralize(
                 res, daily_df, market_cap, market_return, industry_map,
             )
 
-        # 6) IC 分析
+        # 7) IC 分析
         res = self._stage_ic_eval(res)
 
-        # 7) 回测 (带冲击)
+        # 8) 回测 (带冲击 + 风控过闸)
         res = self._stage_backtest(daily_df, res)
 
         return res
@@ -202,10 +231,50 @@ class ResearchPipeline:
             res.warnings.append(f"features 失败: {e}")
         return res
 
+    def _stage_lookahead_scan(self, res):
+        """前视偏差扫描: 横截面 feature vs 未来 return 的相关性."""
+        try:
+            from data_hygiene.lookahead import scan_lookahead_bias
+            feat_df = res.stage_results.get("_feature_df")
+            label_df = res.stage_results.get("_label_df")
+            if feat_df is None or label_df is None:
+                res.warnings.append("无 feature/label, 跳过 lookahead 扫描")
+                return res
+            # 取第一只票 / 第一因子简化扫描
+            if isinstance(feat_df.columns, pd.MultiIndex):
+                feat0 = feat_df.xs(feat_df.columns.get_level_values(0)[0],
+                                    axis=1, level=0)
+            else:
+                feat0 = feat_df
+            # 对齐成单一 Series (打平)
+            common = feat0.index.intersection(label_df.index)
+            if len(common) < 30:
+                res.warnings.append("lookahead 扫描: 样本不足")
+                return res
+            label_flat = label_df.loc[common].stack()
+            feat_flat = feat0.loc[common].stack().reindex(label_flat.index)
+            # scan 要求 DataFrame
+            scan_df = pd.DataFrame({"feat0": feat_flat}).dropna()
+            label_aligned = label_flat.reindex(scan_df.index)
+            report = scan_lookahead_bias(scan_df, label_aligned)
+            res.lookahead_report = report
+            if report.get("verdict") == "FAIL":
+                logger.error(f"前视偏差扫描 FAIL: {report.get('critical_count')} 个 CRITICAL")
+            elif report.get("verdict") == "WARN":
+                res.warnings.append(
+                    f"lookahead: {report.get('high_count')} 个 HIGH 可疑特征"
+                )
+        except Exception as e:
+            res.warnings.append(f"lookahead 扫描失败: {e}")
+        return res
+
     def _stage_neutralize(self, res, daily_df, market_cap,
                            market_return, industry_map):
         try:
-            from barra_neutralize import compute_all_styles, neutralize_by_regression
+            from barra_neutralize import (
+                compute_all_styles, neutralize_by_regression,
+                neutralize_hierarchical,
+            )
 
             # 计算收益矩阵
             ret_df = daily_df.pivot_table(
@@ -227,8 +296,48 @@ class ResearchPipeline:
             res.stage_results["barra"] = {
                 "style_count": styles.shape[1],
                 "stocks": styles.shape[0],
+                "method": self.neutralize_method,
             }
             res.stage_results["_barra_styles"] = styles
+
+            # 若有 feature_df 的"最新一期"因子, 应用中性化并记录诊断
+            feat_df = res.stage_results.get("_feature_df")
+            if feat_df is not None and not feat_df.empty:
+                latest_date = feat_df.index.max()
+                try:
+                    if isinstance(feat_df.columns, pd.MultiIndex):
+                        alpha_raw = (feat_df.xs(
+                            feat_df.columns.get_level_values(0)[0],
+                            axis=1, level=0,
+                        ).loc[latest_date])
+                    else:
+                        alpha_raw = feat_df.loc[latest_date]
+                    alpha_raw = alpha_raw.dropna()
+                    if self.neutralize_method == "hierarchical":
+                        _, diag = neutralize_hierarchical(
+                            alpha_raw, styles.reindex(alpha_raw.index),
+                            industries=industry_map, weights=market_cap.pow(0.5),
+                            return_diagnostics=True,
+                        )
+                    else:
+                        _, diag = neutralize_by_regression(
+                            alpha_raw, styles.reindex(alpha_raw.index),
+                            industries=industry_map, weights=market_cap.pow(0.5),
+                            return_diagnostics=True,
+                        )
+                    res.neutralize_diagnostics = {
+                        "n_samples": diag.n_samples,
+                        "n_style_factors": diag.n_style_factors,
+                        "n_industry_factors": diag.n_industry_factors,
+                        "condition_number": diag.condition_number,
+                        "r_squared": diag.r_squared,
+                        "ridge_alpha": diag.ridge_alpha,
+                        "warnings": diag.warnings,
+                    }
+                    if diag.warnings:
+                        res.warnings.extend(diag.warnings)
+                except Exception as e:
+                    res.warnings.append(f"中性化诊断失败: {e}")
         except Exception as e:
             res.warnings.append(f"Barra 中性化失败: {e}")
         return res
@@ -274,40 +383,89 @@ class ResearchPipeline:
         return res
 
     def _stage_backtest(self, daily_df, res):
-        """简化回测: 按 top-K 策略 + 执行仿真器计算净收益."""
+        """简化回测: 按 top-K 策略 + 执行仿真器 + PreTradeGate 强制过闸."""
         try:
             from execution import BacktestExecutionSim
+            from risk import (
+                PreTradeGate, OrderIntent, Portfolio, build_default_gate,
+            )
+
             label_df = res.stage_results.get("_label_df")
             feat_df = res.stage_results.get("_feature_df")
             if label_df is None or feat_df is None:
                 return res
 
-            # 简化: 用 first feature 选 top10
             if isinstance(feat_df.columns, pd.MultiIndex):
                 f = feat_df[feat_df.columns.get_level_values(0)[0]]
             else:
                 f = feat_df
 
             sim = BacktestExecutionSim()
+            gate = build_default_gate() if self.enforce_risk_gate else None
+            # 简化 portfolio: 回测中的上下文, 仅用来让 gate 通过基础校验
+            portfolio = Portfolio(
+                cash=1_000_000.0, initial_capital=1_000_000.0,
+                high_water_mark=1_000_000.0, daily_start_value=1_000_000.0,
+            )
+
+            # 预取 pct_chg 便于过闸涨跌停判定
+            daily_by_code = {
+                c: g.sort_values("date").set_index("date")
+                for c, g in daily_df.groupby("code")
+            } if "code" in daily_df.columns else {}
+
             daily_returns = []
             turnovers = []
+            n_hard_rejects = 0
 
-            prev_top = set()
-            for dt in f.index[::5]:     # 每 5 天调仓
+            prev_top: set = set()
+            for dt in f.index[::5]:
                 if dt not in f.index or dt not in label_df.index:
                     continue
                 scores = f.loc[dt].dropna()
                 if len(scores) < 10:
                     continue
-                top10 = scores.nlargest(10).index.tolist()
+                top_candidates = scores.nlargest(20).index.tolist()
 
-                # 换手率
-                turnover = len(set(top10) ^ prev_top) / 20
+                # 过闸: 逐个候选跑 PreTradeGate, 拒单不进组合
+                if gate is not None:
+                    admitted: list = []
+                    for code in top_candidates:
+                        row = daily_by_code.get(code)
+                        if row is None or dt not in row.index:
+                            admitted.append(code)  # 缺数据默认放行
+                            continue
+                        snap = row.loc[dt]
+                        price = float(snap.get("close", 0))
+                        # prev_close 估算
+                        if "pct_chg" in snap and price:
+                            pct = float(snap.get("pct_chg", 0)) / 100
+                            prev_close = price / (1 + pct) if (1 + pct) else price
+                        else:
+                            prev_close = price
+                        intent = OrderIntent(
+                            code=str(code), side="buy", shares=100,
+                            price=price, prev_close=prev_close,
+                        )
+                        decision = gate.check(intent, portfolio, today=dt.date() if hasattr(dt, "date") else None)
+                        if decision.allow:
+                            admitted.append(code)
+                        else:
+                            n_hard_rejects += 1
+                        if len(admitted) >= 10:
+                            break
+                    top = admitted
+                else:
+                    top = top_candidates[:10]
+
+                if len(top) == 0:
+                    continue
+
+                turnover = len(set(top) ^ prev_top) / max(len(top) + len(prev_top), 1)
                 turnovers.append(turnover)
-                prev_top = set(top10)
+                prev_top = set(top)
 
-                # 组合收益 (假设等权, 忽略冲击成本简化)
-                label_row = label_df.loc[dt, top10].mean()
+                label_row = label_df.loc[dt, top].mean()
                 if pd.notna(label_row):
                     daily_returns.append(float(label_row))
 
@@ -316,7 +474,7 @@ class ResearchPipeline:
                 return res
 
             arr = np.array(daily_returns)
-            annual_ret = float(arr.mean() * 50)   # 每周一次, 50 周
+            annual_ret = float(arr.mean() * 50)
             annual_vol = float(arr.std() * np.sqrt(50))
             sharpe = annual_ret / (annual_vol + 1e-9)
             max_dd = float(
@@ -330,7 +488,10 @@ class ResearchPipeline:
                 "sharpe": sharpe,
                 "max_drawdown": max_dd,
                 "avg_turnover": float(np.mean(turnovers)) if turnovers else 0,
+                "gate_hard_rejects": int(n_hard_rejects),
             }
+            if gate is not None:
+                res.gate_stats = gate.stats.to_dict()
         except Exception as e:
             res.warnings.append(f"回测失败: {e}")
         return res

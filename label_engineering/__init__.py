@@ -15,10 +15,16 @@ from .horizons import (
     multi_horizon_label, vol_adjusted_label,
     overnight_label, intraday_label,
 )
-from .masks import tradeable_mask, event_window_mask
+from .masks import (
+    tradeable_mask, event_window_mask,
+    disclosure_vs_report_check, timestamp_integrity_check,
+    leaky_label_detector,
+)
 
 __all__ = [
     "multi_horizon_label", "vol_adjusted_label",
     "overnight_label", "intraday_label",
     "tradeable_mask", "event_window_mask",
+    "disclosure_vs_report_check", "timestamp_integrity_check",
+    "leaky_label_detector",
 ]

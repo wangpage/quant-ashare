@@ -21,18 +21,23 @@ def is_mock() -> bool:
 
 # ==================== 对外 API ====================
 def get_market_regime():
+    """Real 模式: 拉沪深300指数 + 当日个股快照, 调 RegimeDetector.
+    失败 fallback 到 mock, 并在返回 dict 里标记 data_source.
+    """
     if DATA_MODE == "real":
         try:
-            # TODO: 接 market_regime.RegimeDetector
             import sys
             from pathlib import Path
             sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-            # from market_regime import RegimeDetector
-            # 待实现: 需要传入 index_df / stocks_daily
-            return _mock.get_market_regime()
-        except Exception:
-            return _mock.get_market_regime()
-    return _mock.get_market_regime()
+            from webapp.live_regime import fetch_live_regime
+            return fetch_live_regime()
+        except Exception as e:
+            m = _mock.get_market_regime()
+            m["data_source"] = f"mock (live 失败: {e.__class__.__name__})"
+            return m
+    result = _mock.get_market_regime()
+    result["data_source"] = "mock"
+    return result
 
 
 def get_theme_scores():

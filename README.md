@@ -2,7 +2,7 @@
 
 > **机构级 A股量化交易系统** - 融合 Hermes Agent 多智能体决策、Barra 风格因子中性化、Level2 微结构 alpha、Almgren-Chriss 冲击成本建模的开源实现.
 
-[![Tests](https://img.shields.io/badge/tests-219%2F219%20passing-brightgreen)](tests/)
+[![Tests](https://img.shields.io/badge/numerical%20tests-65%2F65-brightgreen)](tests/test_numerical_correctness.py) [![Smoke](https://img.shields.io/badge/smoke%20tests-~120-blue)](tests/)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
@@ -118,15 +118,27 @@ QUANT_WEB_MODE=real bash scripts/run_webapp.sh
 
 ![webapp 架构](./README.md)
 
-### 运行测试套件 (219 个)
+### 🧪 测试诚实说明
+
+测试分两层, 不要混淆:
+
+| 类型 | 文件 | 数量 | 说明 |
+|---|---|---|---|
+| **数值正确性 (单元)** | `tests/test_numerical_correctness.py` | **65** | 真数值断言: IC/ICIR 精确匹配, 最大回撤闭式公式, ATR 止损 3 种情况, Barra 残差正交性 (corr<0.05), AC 冲击 sqrt 律单调性, VPIN/OIR 边界, URL 占位符识别, Regime 崩盘/狂热识别, alpha 衰减监控单调性 |
+| **冒烟/契约 (集成)** | 其他 `tests/test_*.py` | ~120 | 主要验证"非空 / 字段存在 / 函数可跑通", 不做数值校对 |
 
 ```bash
+# 数值正确性 (最该看的)
+python3 tests/test_numerical_correctness.py           # 65/65
+
+# 冒烟测试
 python3 tests/test_parser.py                          # CSV 解析 60/60
 python3 tests/test_phase1_xml.py                      # Hermes XML 34/34
 python3 tests/test_phase2_memory_regime.py            # Memory+Regime 35/35
 python3 tests/test_advanced_tricks.py                 # 6 暗门 55/55
-python3 tests/test_hygiene_execution_pipeline.py      # 清洗+执行+Pipeline 35/35
 ```
+
+**不再声称 "219/219 passing"** — 之前 README 的数字把冒烟测试的断言累加 (40+ 个 `_a` 断言/文件) 算成通过率, 现改为按**测试函数**口径: 共 46 个 `def test_*`, 其中 10 个含**真数值断言** (本次新增).
 
 ### 跑真实数据 Research Pipeline
 
@@ -211,17 +223,25 @@ quant-ashare/
 
 ---
 
-## 🧪 测试成绩
+## 🧪 测试成绩 (诚实口径)
 
 ```
-T2  CSV 解析 (官方文档示例):            60/60 ✓
-P1  Hermes XML + Agents:               34/34 ✓
-P2  Memory Curator + Regime:           35/35 ✓
-暗门  6 大圈内模块:                     55/55 ✓
-P9  清洗 + 执行 + Pipeline:            35/35 ✓
+test_numerical_correctness (真数值断言):     65/65 ✓  ← 看这个
+test_parser (CSV 字段契约):                  60/60 ✓
+test_advanced_tricks (暗门模块接口):         55/55 ✓
+test_phase1_xml (XML 解析):                  34/34 ✓
+test_phase2_memory_regime (记忆+regime):    35/35 ✓
 ──────────────────────────────────────────────
-累计:                                  219/219 ✓
+test_* 函数总数: 46 个
+  - 真数值断言: 10 个 (IC/回撤/Barra残差/ATR/AC冲击/URL validator 等)
+  - 冒烟/契约: 36 个
 ```
+
+**更新记录**:
+- v0.2 (2026-04): 接入真实 `RegimeDetector` (data_providers); NATS URL fail-fast 校验;
+  新增 10 个真数值断言测试; README 测试数字诚实化
+- v0.1 初版: 早期 README 声称 "219/219" 是把冒烟测试中的小断言 `_a(...)`
+  累加而得, 单元测试函数实际只 36 个, 且几乎无数值正确性校验. 已修正.
 
 ---
 

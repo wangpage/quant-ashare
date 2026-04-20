@@ -1,32 +1,54 @@
 """执行层 - 从信号到订单的最后一公里.
 
-大众做法: 市价单全量一次性下单.
-真相:
-    - 开盘前 10 分钟 + 尾盘 15 分钟 冲击成本翻倍
-    - 一次性下单 1 亿 Level2 会直接"吃掉"盘口 5 档
-    - 不同策略需要不同执行算法: TWAP / VWAP / POV / Implementation Shortfall
+## 统一接口
 
-本模块提供:
-    - 时段避让: 最优交易时段判定
-    - TWAP / VWAP 拆单
-    - Implementation Shortfall (Almgren-Chriss optimal execution)
-    - 基于盘口 Level2 的冲击感知路由
+推荐上游代码通过 ``ExecutionEngine`` 访问本模块:
+
+    from execution import ExecutionEngine, OrderRequest, Side
+
+    engine = ExecutionEngine.default(strategy="ImpactAware")
+    plan = engine.plan(OrderRequest(
+        code="600519", side=Side.BUY, total_shares=1000,
+        ref_price=1680.0, adv_yuan=5e9, volatility=0.02,
+    ))
+
+所有 Slicer 都实现 ``execution.base.Slicer`` 协议.
+
+## 子模块
+
+- base.py         - OrderRequest / OrderSlice / ExecutionPlan / Slicer 协议
+- time_windows.py - 最优交易时段
+- slicers.py      - TWAP / VWAP / POV
+- impact_router.py - ImpactAwareRouter (sqrt 律 + 盘口 + ADV 20 日口径)
+- simulator.py    - 回测执行仿真
+- engine.py       - ExecutionEngine, 统一入口
 """
+from .base import (
+    OrderRequest, OrderSlice, ExecutionPlan, Side, Slicer,
+    clip_to_trading_session, effective_trading_minutes,
+)
 from .time_windows import (
-    OptimalTradingWindow, is_tradeable_now,
-    avoid_auction_window,
+    OptimalTradingWindow, WindowQuality,
+    is_tradeable_now, avoid_auction_window,
 )
 from .slicers import (
     TWAPSlicer, VWAPSlicer, POVSlicer,
 )
 from .impact_router import (
-    ImpactAwareRouter, split_order_by_participation,
+    ImpactAwareRouter, RoutingPlan,
+    split_order_by_participation, estimate_adv_yuan,
 )
-from .simulator import BacktestExecutionSim
+from .simulator import BacktestExecutionSim, ExecutionResult
+from .engine import ExecutionEngine
 
 __all__ = [
-    "OptimalTradingWindow", "is_tradeable_now", "avoid_auction_window",
+    "OrderRequest", "OrderSlice", "ExecutionPlan", "Side", "Slicer",
+    "clip_to_trading_session", "effective_trading_minutes",
+    "OptimalTradingWindow", "WindowQuality",
+    "is_tradeable_now", "avoid_auction_window",
     "TWAPSlicer", "VWAPSlicer", "POVSlicer",
-    "ImpactAwareRouter", "split_order_by_participation",
-    "BacktestExecutionSim",
+    "ImpactAwareRouter", "RoutingPlan",
+    "split_order_by_participation", "estimate_adv_yuan",
+    "BacktestExecutionSim", "ExecutionResult",
+    "ExecutionEngine",
 ]
