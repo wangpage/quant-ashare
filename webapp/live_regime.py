@@ -65,10 +65,20 @@ def _fetch_index_df(days_back: int = 300) -> pd.DataFrame:
 def _fetch_stocks_snapshot(limit: int = 100) -> tuple[pd.DataFrame, float]:
     """拉 top-N 活跃股, 估算两市成交额 (亿元).
 
+    容错:
+        东财 clist 接口容易被限频 (与 kline 接口独立). 失败时返回 (空 df, 0.0),
+        让 RegimeDetector 降级到纯指数驱动 (只做 trend+vol 判断, 无 breadth).
+
     注: 东财 hot_stocks 返回的 amount 是元, 需换算.
     实际两市成交额 ~= top1000 * 放大, 这里用 top100 × 缩放因子近似.
     """
-    hot = fetch_hot_stocks(limit=limit)
+    try:
+        hot = fetch_hot_stocks(limit=limit)
+    except Exception as e:
+        logger.warning(f"hot_stocks 失败 ({e.__class__.__name__}), "
+                        f"regime 将走纯指数降级模式")
+        return pd.DataFrame(), 0.0
+
     if not hot:
         return pd.DataFrame(), 0.0
 
@@ -76,15 +86,11 @@ def _fetch_stocks_snapshot(limit: int = 100) -> tuple[pd.DataFrame, float]:
     # 兼容字段缺失
     if "amount" not in df.columns:
         df["amount"] = 0
-    # 东财 f3 = 涨跌幅 (%), 已在 hot_stocks 里 map 成 price 等字段
-    # fetch_hot_stocks 没直接返回 pct_chg, 我们从 price/pre_close 推导不现实
-    # 退化: 用 volume 排序 + 取 f3 (如果字段里有)
     if "pct_chg" not in df.columns:
-        # 无该字段时给中性值, 让 RegimeDetector 走 trend 判断
+        # 东财 hot_stocks 映射没带 f3; 无则给中性, 让 RegimeDetector 走 trend
         df["pct_chg"] = 0.0
 
-    # 估算两市成交额: top100 成交额求和 × 经验放大系数
-    # A 股日常: top100 占两市 25-35%, 我们用 × 3.5 近似
+    # 估算两市成交额: top100 成交额求和 × 经验放大系数 (A股 top100 占 25-35%)
     top100_amount = df["amount"].fillna(0).astype(float).sum()
     total_turnover_yi = top100_amount * 3.5 / 1e8     # 元 → 亿元
 
@@ -104,13 +110,29 @@ def fetch_live_regime(cache: bool = True) -> dict:
         raise RuntimeError(f"沪深300指数数据不足 ({len(index_df)} 行), 无法判定 regime")
 
     stocks_df, total_turnover = _fetch_stocks_snapshot(limit=100)
+    has_breadth = not stocks_df.empty
 
     detector = RegimeDetector()
     signal = detector.detect(
         index_df=index_df,
-        stocks_daily=stocks_df if not stocks_df.empty else None,
+        stocks_daily=stocks_df if has_breadth else None,
         total_turnover_yi=total_turnover if total_turnover > 0 else None,
     )
+
+    # 降级时明确标注: breadth 维度不可信
+    reasons = list(signal.reasons)
+    if not has_breadth:
+        reasons.insert(
+            0,
+            "⚠ 降级模式: hot_stocks 接口失败, regime 仅基于沪深300指数 "
+            "(trend + vol), breadth/流动性/涨停家数 不可信",
+        )
+
+    # 数据源精细化: 指数 live, breadth 可能 degraded
+    if has_breadth:
+        data_source = "live"
+    else:
+        data_source = "live (degraded: 仅指数, 无 breadth)"
 
     # 转换为 webapp 契约 (与 mock_data.get_market_regime 返回结构一致)
     result = {
@@ -124,13 +146,14 @@ def fetch_live_regime(cache: bool = True) -> dict:
         "liquidity_level": signal.breadth.liquidity_level,
         "breadth_pct_up": float(signal.breadth.pct_up),
         "limit_up_count": int(signal.breadth.pct_limit_up * len(stocks_df))
-                           if not stocks_df.empty else 0,
+                           if has_breadth else 0,
         "limit_down_count": int(signal.breadth.pct_limit_down * len(stocks_df))
-                             if not stocks_df.empty else 0,
-        "reasons": signal.reasons,
-        "data_source": "live",
+                             if has_breadth else 0,
+        "reasons": reasons,
+        "data_source": data_source,
         "total_turnover_yi": total_turnover,
         "index_rows": len(index_df),
+        "has_breadth": has_breadth,
     }
 
     if cache:
