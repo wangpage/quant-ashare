@@ -50,7 +50,11 @@ def _default_adv_yuan(req: OrderRequest) -> float:
 
 
 class TWAPSlicer:
-    """时间均匀拆单."""
+    """时间均匀拆单. 支持新旧两种 API:
+
+    新 (推荐): twap.slice(OrderRequest) -> ExecutionPlan
+    旧 (兼容): twap.slice(total_shares=..., start=..., end=..., n_slices=...) -> list[OrderSlice]
+    """
     name = "TWAP"
 
     def __init__(self, n_slices: int = 10,
@@ -59,7 +63,27 @@ class TWAPSlicer:
         self.avoid_opening_min = avoid_opening_min
         self.avoid_closing_min = avoid_closing_min
 
-    def slice(self, req: OrderRequest) -> ExecutionPlan:
+    def slice(self, req: OrderRequest | None = None, **legacy_kwargs):
+        """双模式: 传 OrderRequest 走新路径, 传 kwargs 走旧路径返 list."""
+        if req is None:
+            # 旧 API: total_shares=..., start=..., end=..., n_slices=...
+            total_shares = legacy_kwargs.get("total_shares")
+            if total_shares is None:
+                raise TypeError("必须传 OrderRequest 或 total_shares=...")
+            start = legacy_kwargs.get("start")
+            end = legacy_kwargs.get("end")
+            n_slices = legacy_kwargs.get("n_slices", self.n_slices)
+            self.n_slices = n_slices
+            legacy_req = OrderRequest(
+                code="", side=Side.BUY, total_shares=int(total_shares),
+                ref_price=1.0, start_time=start, end_time=end,
+                adv_yuan=1e12,   # 让冲击成本可忽略, 旧测只看切片
+            )
+            plan = self._plan(legacy_req)
+            return plan.slices  # 旧调用期望 list[OrderSlice]
+        return self._plan(req)
+
+    def _plan(self, req: OrderRequest) -> ExecutionPlan:
         if req.start_time is None or req.end_time is None:
             raise ValueError("TWAPSlicer 需要 start_time 和 end_time")
 
@@ -122,7 +146,11 @@ class TWAPSlicer:
 
 
 class VWAPSlicer:
-    """按历史 U 型成交量曲线分布拆单."""
+    """按历史 U 型成交量曲线分布拆单.
+
+    新 API: slice(OrderRequest) -> ExecutionPlan
+    旧 API: slice(total_shares=, start=, end=, n_slices=) -> list[OrderSlice]
+    """
     name = "VWAP"
 
     def __init__(self, volume_curve: pd.Series | None = None, n_slices: int = 20):
@@ -146,7 +174,24 @@ class VWAPSlicer:
         idx = pd.RangeIndex(0, 240, name="min_of_session")
         return pd.Series(curve, index=idx)
 
-    def slice(self, req: OrderRequest) -> ExecutionPlan:
+    def slice(self, req: OrderRequest | None = None, **legacy_kwargs):
+        if req is None:
+            total_shares = legacy_kwargs.get("total_shares")
+            if total_shares is None:
+                raise TypeError("必须传 OrderRequest 或 total_shares=...")
+            self.n_slices = legacy_kwargs.get("n_slices", self.n_slices)
+            req = OrderRequest(
+                code="", side=Side.BUY, total_shares=int(total_shares),
+                ref_price=1.0,
+                start_time=legacy_kwargs.get("start"),
+                end_time=legacy_kwargs.get("end"),
+                adv_yuan=1e12,
+            )
+            plan = self._plan(req)
+            return plan.slices
+        return self._plan(req)
+
+    def _plan(self, req: OrderRequest) -> ExecutionPlan:
         start = req.start_time or datetime.combine(
             datetime.today().date(), time(9, 30)
         )
@@ -215,6 +260,19 @@ class POVSlicer:
 
     def __init__(self, participation_rate: float = 0.10):
         self.rate = participation_rate
+
+    # 旧测兼容: 实盘循环常用的两个辅助函数
+    def estimate_duration_minutes(
+        self, total_shares: int, expected_market_volume_per_min: int,
+    ) -> float:
+        my_rate = expected_market_volume_per_min * self.rate
+        if my_rate <= 0:
+            return float("inf")
+        return total_shares / my_rate
+
+    def next_slice_size(self, market_vol_last_minute: int) -> int:
+        raw = int(market_vol_last_minute * self.rate)
+        return (raw // 100) * 100
 
     def slice(self, req: OrderRequest) -> ExecutionPlan:
         mv_forecast = req.meta.get("market_volume_forecast")

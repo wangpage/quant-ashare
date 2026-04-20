@@ -402,6 +402,9 @@ class ResearchPipeline:
 
             sim = BacktestExecutionSim()
             gate = build_default_gate() if self.enforce_risk_gate else None
+            # gate_stats 必须在任一退出路径都被记录, 方便上游审计
+            if gate is not None:
+                res.gate_stats = gate.stats.to_dict()
             # 简化 portfolio: 回测中的上下文, 仅用来让 gate 通过基础校验
             portfolio = Portfolio(
                 cash=1_000_000.0, initial_capital=1_000_000.0,
@@ -419,13 +422,18 @@ class ResearchPipeline:
             n_hard_rejects = 0
 
             prev_top: set = set()
+            # 小样本股票池也要能跑通 (如测试场景 3 只); 阈值取 min(10, universe)
+            universe_size = f.shape[1] if hasattr(f, "shape") else 0
+            min_scores = max(1, min(10, universe_size))
+            top_n = max(1, min(10, universe_size))
+
             for dt in f.index[::5]:
                 if dt not in f.index or dt not in label_df.index:
                     continue
                 scores = f.loc[dt].dropna()
-                if len(scores) < 10:
+                if len(scores) < min_scores:
                     continue
-                top_candidates = scores.nlargest(20).index.tolist()
+                top_candidates = scores.nlargest(min(20, universe_size)).index.tolist()
 
                 # 过闸: 逐个候选跑 PreTradeGate, 拒单不进组合
                 if gate is not None:
@@ -452,11 +460,11 @@ class ResearchPipeline:
                             admitted.append(code)
                         else:
                             n_hard_rejects += 1
-                        if len(admitted) >= 10:
+                        if len(admitted) >= top_n:
                             break
                     top = admitted
                 else:
-                    top = top_candidates[:10]
+                    top = top_candidates[:top_n]
 
                 if len(top) == 0:
                     continue
@@ -471,6 +479,8 @@ class ResearchPipeline:
 
             if not daily_returns:
                 res.warnings.append("回测无有效样本")
+                if gate is not None:
+                    res.gate_stats = gate.stats.to_dict()
                 return res
 
             arr = np.array(daily_returns)

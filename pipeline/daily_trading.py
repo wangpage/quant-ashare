@@ -137,22 +137,71 @@ class DailyTradingPipeline:
         return decision
 
     def _stage_risk(self, decision, total_capital):
-        """简化风控: 总仓位 × regime_mult, 单票 ≤ 15%."""
+        """风控: regime_mult 总仓 + PreTradeGate 逐票过闸.
+
+        实盘和回测共用 PreTradeGate 中间件, 保证规则一致.
+        """
         tradeable_cash = total_capital * decision.position_mult
         per_stock_max = total_capital * 0.15
         n = len(decision.candidates)
         if n == 0:
             return decision
-        alloc = tradeable_cash / n
-        alloc = min(alloc, per_stock_max)
+        alloc = min(tradeable_cash / n, per_stock_max)
+
+        # 构造一个"当前 portfolio 状态"以便 gate 判仓位 / 现金率
+        try:
+            from risk import Portfolio, build_default_gate, OrderIntent
+            gate = build_default_gate()
+            portfolio = Portfolio(
+                cash=total_capital, initial_capital=total_capital,
+                high_water_mark=total_capital,
+                daily_start_value=total_capital,
+            )
+            gate_enabled = True
+        except Exception as e:
+            decision.notes.append(f"gate 不可用: {e}")
+            gate_enabled = False
+
         for c in decision.candidates:
             # agent 否决优先
             if c.get("agent_action") == "hold":
                 c["alloc_cny"] = 0
                 c["risk_filtered"] = True
+                c["risk_reason"] = "agent_hold"
+                continue
+
+            if gate_enabled:
+                price = float(c.get("ref_price") or c.get("price") or 0) or 50.0
+                prev_close = float(c.get("prev_close") or price)
+                shares = int((alloc / max(price, 1e-6)) // 100 * 100)
+                if shares <= 0:
+                    c["alloc_cny"] = 0
+                    c["risk_filtered"] = True
+                    c["risk_reason"] = "不足1手"
+                    continue
+                intent = OrderIntent(
+                    code=c["code"], side="buy", shares=shares,
+                    price=price, prev_close=prev_close,
+                    industry=str(c.get("industry", "")),
+                    suspended=bool(c.get("suspended", False)),
+                    conviction=float(c.get("agent_conviction",
+                                            c.get("score", 0.5))),
+                )
+                dec = gate.check(intent, portfolio)
+                if dec.allow:
+                    c["alloc_cny"] = float(dec.adjusted_shares * price)
+                    c["risk_filtered"] = False
+                    c["risk_reason"] = dec.reason
+                else:
+                    c["alloc_cny"] = 0
+                    c["risk_filtered"] = True
+                    c["risk_reason"] = dec.reason
             else:
                 c["alloc_cny"] = float(alloc)
                 c["risk_filtered"] = False
+
+        if gate_enabled:
+            decision.notes.append(f"gate_stats={gate.stats.to_dict()}")
         return decision
 
     def _stage_routing(self, decision, stocks_daily, total_capital):

@@ -41,6 +41,11 @@ class OrderSlice:
     notes: str = ""
     warnings: list[str] = field(default_factory=list)
 
+    @property
+    def target_shares(self) -> int:
+        """向后兼容别名 (旧 TWAPSlicer.slice 返回的 dataclass 字段)."""
+        return self.shares
+
 
 @dataclass
 class OrderRequest:
