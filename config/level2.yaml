@@ -1,0 +1,85 @@
+# Level2 行情接入配置 - base32.cn 真实服务器 (2026-04-20 拿到文档后更新)
+
+connection:
+  servers:
+    shanghai:
+      host: "nats://43.143.73.95:31886"
+      backup: "nats://db.base32.cn:31886"
+    guangzhou:
+      host: "nats://43.138.245.99:31886"
+      backup: "nats://db.base32.cn:31886"
+  active: "shanghai"          # 华东就近, 如在华南改 guangzhou
+
+  auth:
+    user: "level2_test"
+    password: "level2@test"
+
+  timeout_seconds: 10
+  ping_interval: 20
+  max_reconnect: -1
+  reconnect_wait: 2
+
+# 真实 topic 格式 (xxxxxx = 股票6位代码, 无后缀)
+topics:
+  trans:       "level2.trans.{code}"     # 逐笔成交 (11字段CSV)
+  order:       "level2.order.{code}"     # 逐笔委托 (11字段CSV)
+  rapid:       "level2.rapid.{code}"     # 合成订单簿5档 (37字段CSV)
+  simple:      "level2.simple.{code}"    # 简化合成订单簿1档 (13字段CSV)
+  depth:       "level2.depth.{code}"     # L2十档订单簿 (61字段CSV)
+  l1_market:   "level1.market.{code}"    # L1五档订单簿 (41字段CSV)
+  l1_flow:     "level1.flow.{code}"      # 大单资金流 (29字段CSV)
+
+# 测试账号只支持这两只, 正式账号改此列表
+test_instruments:
+  - "300750"                  # 宁德时代 (深市)
+  - "600519"                  # 贵州茅台 (沪市)
+
+# 订阅的数据类型 (测试账号建议: 只开 trans+order+simple, 减少流量)
+enable_types:
+  trans: true
+  order: true
+  rapid: false                # 合成订单簿一个标的 = 10个逐笔量
+  simple: true                # 简化 - 流量友好
+  depth: false                # 要额外权限
+  l1_market: false
+  l1_flow: false
+
+message_format: "csv"         # CSV 分隔符数据, 非 JSON
+
+# 限制
+limits:
+  max_subscribe: 100          # 系统限制
+  max_rapid: 50               # 合成订单簿限制
+  max_ip_connections: 50      # 超过会封 IP
+
+# 压测参数
+stress_test:
+  duration_seconds: 60
+  warmup_seconds: 5
+  latency_sla_ms: 500         # 上海15Oms, 深圳10ms; 开盘可能10-20s
+  throughput_sla_per_sec: 100 # 测试账号仅2只, 实际低; 生产5000+
+
+# 存盘
+storage:
+  enable: false
+  format: "parquet"
+  dir: "./cache/level2"
+  rotate_mb: 500
+
+# 告警
+alerts:
+  max_latency_ms: 2000
+  heartbeat_gap_seconds: 30
+
+# ClickHouse 复盘数据 (盘后查询)
+clickhouse:
+  public:                     # 公网高速
+    host: "db.base32.cn"
+    tcp_port: 9000
+    http_port: 8123
+  internal:                   # 内网
+    host: "43.143.73.95"
+    tcp_port: 31888
+    http_port: 31889
+  user: "REPLACE_WITH_REAL"
+  password: "REPLACE_WITH_REAL"

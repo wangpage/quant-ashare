@@ -1,0 +1,77 @@
+project:
+  name: "A股短线量化系统"
+  version: "0.1.0"
+  timezone: "Asia/Shanghai"
+
+data:
+  cache_dir: "./cache"
+  db_path: "./cache/market.db"
+  start_date: "2020-01-01"
+  end_date: "2026-04-20"
+  universe:
+    market_cap_min: 3.0e9
+    market_cap_max: 5.0e11
+    exclude_st: true
+    exclude_new: 250
+    exclude_suspend: true
+
+features:
+  lookback_windows: [3, 5, 10, 20, 60]
+  winsorize_sigma: 3.0
+  neutralize:
+    - market_cap
+    - industry
+
+model:
+  type: "lightgbm"
+  target:
+    type: "rank"
+    horizon: 5
+    top_pct: 0.2
+  params:
+    num_leaves: 31
+    learning_rate: 0.05
+    n_estimators: 500
+    max_depth: 6
+    min_child_samples: 50
+    reg_alpha: 0.1
+    reg_lambda: 0.1
+    subsample: 0.8
+    colsample_bytree: 0.8
+    random_state: 42
+  train:
+    train_ratio: 0.6
+    val_ratio: 0.2
+    test_ratio: 0.2
+    rolling_window_days: 500
+    retrain_freq_days: 20
+
+backtest:
+  initial_capital: 1000000
+  commission: 0.00025
+  stamp_tax: 0.001
+  slippage: 0.002
+  min_trade_amount: 10000
+  benchmark: "sh000300"
+
+strategy:
+  name: "short_term_ml"
+  holding_days: 5
+  top_k_stocks: 20
+  rebalance_freq: "daily"
+  signal_threshold: 0.6
+
+risk:
+  max_position_per_stock: 0.15
+  max_position_per_industry: 0.30
+  stop_loss: -0.05
+  stop_profit: 0.10
+  daily_loss_limit: -0.03
+  max_drawdown_limit: -0.15
+  kelly_fraction: 0.25
+  min_cash_ratio: 0.10
+
+market_filter:
+  bear_market_ma: 200
+  crash_signal_drop: -0.05
+  enable_market_filter: true
