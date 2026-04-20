@@ -102,10 +102,19 @@ def compute_non_linear_size(size_factor: pd.Series) -> pd.Series:
     操作:
         1. NLS = Size ^ 3
         2. 对 Size 回归, 取残差 (所以叫 'non-linear')
+
+    退化保护: 若 Size 方差 ~0 (外层传了常数 market_cap), 返回零 Series,
+    避免 polyfit 抛 SVD 异常, 上游调用 compute_all_styles 时不会整体失败.
     """
+    clean = size_factor.dropna()
+    if len(clean) < 3 or clean.std() < 1e-12:
+        return pd.Series(0.0, index=size_factor.index)
     nls = size_factor ** 3
     # 对 Size 回归取残差
-    beta = np.polyfit(size_factor.values, nls.values, 1)
+    try:
+        beta = np.polyfit(clean.values, (clean ** 3).values, 1)
+    except (np.linalg.LinAlgError, ValueError):
+        return pd.Series(0.0, index=size_factor.index)
     residual = nls - (beta[0] * size_factor + beta[1])
     return _zscore(residual)
 

@@ -73,6 +73,24 @@ class ResearchPipeline:
         lookahead_scan: bool = True,
         fail_on_lookahead_critical: bool = True,
         enforce_risk_gate: bool = True,
+        use_alpha158: bool = False,                 # True = 用 Alpha158-lite 替代玩具因子
+        neutralize_residual: bool = False,          # True = alpha 选股前先取 Barra 残差
+        compose_signal: bool = True,                 # False = 只取第一因子 (baseline)
+        portfolio_method: str = "equal_weight",      # equal_weight | inverse_vol | risk_parity
+        rebalance_freq: int = 5,                     # 调仓步长 (f.index[::freq])
+        top_k: int = 10,                             # 每期持仓数上限
+        top_k_ratio: float | None = None,            # 若给, 用 max(1, int(ratio*universe))
+        cov_lookback: int = 60,                      # risk_parity / inverse_vol 的回看天数
+        turnover_buffer: float = 0.0,                # [0,1); 旧持仓仍在 top(1+buffer)*top_k 保留
+        ic_gate: bool = False,                       # True = rolling IC<0 的期间强制空仓
+        ic_gate_window: int = 20,
+        signal_ema_span: int = 1,                    # 1=不平滑; 3~5 去信号噪声
+        vol_target: float | None = None,             # 组合年化波动目标, 如 0.15; None=不启用
+        vol_target_window: int = 20,                 # 滚动窗口估计实现波动
+        vol_target_max_leverage: float = 1.5,        # 杠杆上限 (平静期加仓)
+        vol_target_min_leverage: float = 0.3,        # 仓位下限 (波动期防御)
+        signal_risk_adjust: bool = False,            # True = 排序按 signal / past_vol
+        experiment_name: str = "baseline",
     ):
         self.label_horizons = label_horizons or [1, 3, 5, 10]
         self.label_weights = label_weights or [0.4, 0.3, 0.2, 0.1]
@@ -82,6 +100,24 @@ class ResearchPipeline:
         self.lookahead_scan = lookahead_scan
         self.fail_on_lookahead_critical = fail_on_lookahead_critical
         self.enforce_risk_gate = enforce_risk_gate
+        self.use_alpha158 = use_alpha158
+        self.neutralize_residual = neutralize_residual
+        self.compose_signal = compose_signal
+        self.portfolio_method = portfolio_method
+        self.rebalance_freq = max(1, int(rebalance_freq))
+        self.top_k = max(1, int(top_k))
+        self.top_k_ratio = top_k_ratio
+        self.cov_lookback = max(10, int(cov_lookback))
+        self.turnover_buffer = max(0.0, float(turnover_buffer))
+        self.ic_gate = ic_gate
+        self.ic_gate_window = max(5, int(ic_gate_window))
+        self.signal_ema_span = max(1, int(signal_ema_span))
+        self.vol_target = vol_target
+        self.vol_target_window = max(5, int(vol_target_window))
+        self.vol_target_max_leverage = float(vol_target_max_leverage)
+        self.vol_target_min_leverage = float(vol_target_min_leverage)
+        self.signal_risk_adjust = bool(signal_risk_adjust)
+        self.experiment_name = experiment_name
 
     def run(
         self,
@@ -135,6 +171,9 @@ class ResearchPipeline:
             res = self._stage_neutralize(
                 res, daily_df, market_cap, market_return, industry_map,
             )
+
+        # 6.5) 多因子合成 composite signal (+ 可选 Barra 残差化)
+        res = self._stage_signal(res)
 
         # 7) IC 分析
         res = self._stage_ic_eval(res)
@@ -205,7 +244,23 @@ class ResearchPipeline:
                                               "source": "external"}
             res.stage_results["_feature_df"] = feature_df
             return res
-        # 简化: 生成 3 个示例因子
+
+        if self.use_alpha158:
+            try:
+                from factors.alpha158_lite import compute_alpha158_panel
+                feature_df = compute_alpha158_panel(daily_df)
+                n_factors = int(feature_df.columns.get_level_values(0).nunique())
+                res.stage_results["features"] = {
+                    "source": "alpha158_lite",
+                    "n_factors": n_factors,
+                    "shape": feature_df.shape,
+                }
+                res.stage_results["_feature_df"] = feature_df
+                return res
+            except Exception as e:
+                res.warnings.append(f"alpha158 生成失败, 退化玩具因子: {e}")
+
+        # 玩具 baseline: 3 个示例因子
         try:
             f = {}
             for code, g in daily_df.groupby("code"):
@@ -217,12 +272,12 @@ class ResearchPipeline:
                     "vol_20d": close.pct_change().rolling(20).std(),
                 })
                 f[code] = feat_code
-            # 合并成 multi-index [date, code]
             combined = pd.concat(f, axis=0, names=["code", "date"])
             feature_df = combined.reset_index().pivot_table(
                 index="date", columns="code",
             )
             res.stage_results["features"] = {
+                "source": "toy_baseline",
                 "auto_generated": 3,
                 "shape": feature_df.shape,
             }
@@ -342,23 +397,127 @@ class ResearchPipeline:
             res.warnings.append(f"Barra 中性化失败: {e}")
         return res
 
+    def _stage_signal(self, res):
+        """多因子合成 composite signal. 可选: 对每截面取 Barra 残差.
+
+        baseline (compose_signal=False) 直接取第一个因子作为 signal,
+        与历史 IC/backtest 行为完全一致.
+        """
+        try:
+            feat_df = res.stage_results.get("_feature_df")
+            if feat_df is None or feat_df.empty:
+                return res
+
+            if not self.compose_signal:
+                # baseline: 只取第一因子, 不做合成
+                if isinstance(feat_df.columns, pd.MultiIndex):
+                    first = feat_df.columns.get_level_values(0)[0]
+                    signal = feat_df[first]
+                else:
+                    signal = feat_df
+                res.stage_results.setdefault("signal", {}).update({
+                    "composite": "first_factor_only",
+                })
+                res.stage_results["_signal_df"] = signal
+                return res
+
+            # 多因子: 优先 Rolling IC 加权 (无前视偏差, 自适应 regime 切换)
+            if isinstance(feat_df.columns, pd.MultiIndex):
+                from factors.alpha158_lite import (
+                    combine_factors_equal_weight,
+                    combine_factors_rolling_ic,
+                )
+                label_df = res.stage_results.get("_label_df")
+                if label_df is not None and not label_df.empty:
+                    signal = combine_factors_rolling_ic(
+                        feat_df, label_df, window=60, top_k=8,
+                    )
+                    last_log = signal.attrs.get("selection_log", [])
+                    last_factors = last_log[-1]["top_5"] if last_log else []
+                    res.stage_results.setdefault("signal", {}).update({
+                        "composite": "rolling_ic_weighted",
+                        "window": signal.attrs.get("window"),
+                        "latest_top_factors": [
+                            f"{f}:{ic:+.3f}" for f, ic in last_factors
+                        ],
+                    })
+                else:
+                    signal = combine_factors_equal_weight(feat_df)
+                    res.stage_results.setdefault("signal", {})["composite"] = "equal_weight"
+            else:
+                signal = feat_df
+
+            # 可选: Barra 残差化 (每期截面 alpha 对风格因子回归取残差)
+            if self.neutralize_residual:
+                styles = res.stage_results.get("_barra_styles")
+                if styles is not None and not styles.empty:
+                    from barra_neutralize import neutralize_hierarchical
+                    resid_by_date = {}
+                    resid_count = 0
+                    for dt in signal.index:
+                        alpha_t = signal.loc[dt].dropna()
+                        if len(alpha_t) < 20:
+                            resid_by_date[dt] = alpha_t
+                            continue
+                        try:
+                            r = neutralize_hierarchical(
+                                alpha_t,
+                                styles.reindex(alpha_t.index),
+                                ridge_alpha=1e-2,
+                            )
+                            resid_by_date[dt] = r
+                            resid_count += 1
+                        except Exception:
+                            resid_by_date[dt] = alpha_t
+                    signal = pd.DataFrame(resid_by_date).T
+                    # 追加残差化信息, 不覆盖 composite 元数据
+                    res.stage_results.setdefault("signal", {}).update({
+                        "residualized_by_barra": True,
+                        "n_residualized_dates": resid_count,
+                    })
+                else:
+                    res.warnings.append(
+                        "neutralize_residual=True 但无 Barra styles, 跳过"
+                    )
+            # 信号 EMA 平滑 (降噪 + 降换手).  signal.ewm(span).mean() 在每列
+            # 独立做时间方向的指数平滑, 不是横截面操作, 所以无前视.
+            if self.signal_ema_span > 1 and hasattr(signal, "ewm"):
+                try:
+                    smoothed = signal.ewm(
+                        span=self.signal_ema_span, adjust=False,
+                    ).mean()
+                    # 前 span 期用原值 (ewm 在数据不足时的输出会 lag 到 0)
+                    signal = smoothed
+                    res.stage_results.setdefault("signal", {}).update({
+                        "ema_span": self.signal_ema_span,
+                    })
+                except Exception as e:
+                    res.warnings.append(f"EMA 平滑失败: {e}")
+
+            if "signal" not in res.stage_results:
+                res.stage_results["signal"] = {"composite": "passthrough"}
+            res.stage_results["_signal_df"] = signal
+        except Exception as e:
+            res.warnings.append(f"signal 合成失败: {e}")
+        return res
+
     def _stage_ic_eval(self, res):
         try:
             from alpha_decay import rolling_ic_decay, half_life_estimate
             from alpha_decay.monitor import ic_ir
 
             label_df = res.stage_results.get("_label_df")
+            # 优先用合成 signal (Alpha158-lite 需要), 否则退化到第一因子
+            signal_df = res.stage_results.get("_signal_df")
             feat_df = res.stage_results.get("_feature_df")
-            if label_df is None or feat_df is None:
+            if label_df is None or (signal_df is None and feat_df is None):
                 res.warnings.append("无 label 或 feature, 跳过 IC")
                 return res
 
-            # 取第一个因子 (示例)
-            first_feat_name = feat_df.columns.get_level_values(0)[0] \
-                if isinstance(feat_df.columns, pd.MultiIndex) else \
-                feat_df.columns[0]
-            if isinstance(feat_df.columns, pd.MultiIndex):
-                f = feat_df[first_feat_name]
+            if signal_df is not None:
+                f = signal_df
+            elif isinstance(feat_df.columns, pd.MultiIndex):
+                f = feat_df[feat_df.columns.get_level_values(0)[0]]
             else:
                 f = feat_df
 
@@ -383,35 +542,62 @@ class ResearchPipeline:
         return res
 
     def _stage_backtest(self, daily_df, res):
-        """简化回测: 按 top-K 策略 + 执行仿真器 + PreTradeGate 强制过闸."""
+        """Top-K + 组合优化 + 换手 buffer + 可选 IC gating 回测.
+
+        权重方案 portfolio_method:
+            equal_weight  (默认): 每股 1/N, 兼容历史 baseline
+            inverse_vol:  w_i ∝ 1/σ_i, 基于过去 cov_lookback 日日收益
+            risk_parity:  边际风险贡献相等, 基于过去 cov_lookback 日协方差
+
+        换手 buffer (turnover_buffer): 若旧持仓当日 rank 仍在前
+        top_k*(1+buffer) 之内, 不触发换仓, 避免 "边缘排序抖动" 造成的
+        假换手吃成本.
+
+        IC gating (ic_gate): 用 _ic_df 的 rolling_ic (长度 ic_gate_window)
+        若最新一期 <=0, 本期空仓 (实盘意义: alpha 方向反转时避险).
+        """
         try:
             from execution import BacktestExecutionSim
             from risk import (
                 PreTradeGate, OrderIntent, Portfolio, build_default_gate,
             )
+            from portfolio_opt import (
+                inverse_volatility_weights, risk_parity_weights,
+            )
 
             label_df = res.stage_results.get("_label_df")
+            signal_df = res.stage_results.get("_signal_df")
             feat_df = res.stage_results.get("_feature_df")
-            if label_df is None or feat_df is None:
+            if label_df is None or (signal_df is None and feat_df is None):
                 return res
 
-            if isinstance(feat_df.columns, pd.MultiIndex):
+            # 同样优先用 composite signal
+            if signal_df is not None:
+                f = signal_df
+            elif isinstance(feat_df.columns, pd.MultiIndex):
                 f = feat_df[feat_df.columns.get_level_values(0)[0]]
             else:
                 f = feat_df
 
+            # 收益面板 (供 inverse_vol / risk_parity 使用)
+            try:
+                ret_panel = daily_df.pivot_table(
+                    index="date", columns="code", values="close",
+                ).pct_change()
+                if not isinstance(ret_panel.index, pd.DatetimeIndex):
+                    ret_panel.index = pd.to_datetime(ret_panel.index)
+            except Exception:
+                ret_panel = None
+
             sim = BacktestExecutionSim()
             gate = build_default_gate() if self.enforce_risk_gate else None
-            # gate_stats 必须在任一退出路径都被记录, 方便上游审计
             if gate is not None:
                 res.gate_stats = gate.stats.to_dict()
-            # 简化 portfolio: 回测中的上下文, 仅用来让 gate 通过基础校验
             portfolio = Portfolio(
                 cash=1_000_000.0, initial_capital=1_000_000.0,
                 high_water_mark=1_000_000.0, daily_start_value=1_000_000.0,
             )
 
-            # 预取 pct_chg 便于过闸涨跌停判定
             daily_by_code = {
                 c: g.sort_values("date").set_index("date")
                 for c, g in daily_df.groupby("code")
@@ -419,33 +605,82 @@ class ResearchPipeline:
 
             daily_returns = []
             turnovers = []
+            rebal_dates: list = []   # 每次调仓的日期, 与 daily_returns 一一对应
             n_hard_rejects = 0
+            n_ic_gated = 0
 
             prev_top: set = set()
-            # 小样本股票池也要能跑通 (如测试场景 3 只); 阈值取 min(10, universe)
+            prev_weights: pd.Series | None = None
             universe_size = f.shape[1] if hasattr(f, "shape") else 0
-            min_scores = max(1, min(10, universe_size))
-            top_n = max(1, min(10, universe_size))
+            if self.top_k_ratio is not None:
+                top_n = max(1, int(universe_size * self.top_k_ratio))
+            else:
+                top_n = max(1, min(self.top_k, universe_size))
+            min_scores = max(1, min(self.top_k, universe_size))
 
-            for dt in f.index[::5]:
+            # 调仓日列表 (按 rebalance_freq 抽样), 带一个 "buffer 上限" 用于换手判断
+            buf_n = int(top_n * (1 + self.turnover_buffer))
+
+            ic_df = res.stage_results.get("_ic_df")
+
+            for dt in f.index[::self.rebalance_freq]:
                 if dt not in f.index or dt not in label_df.index:
                     continue
+
+                # IC gating: rolling IC <= 0 则当期空仓 (仍算一次调仓, 收益=0)
+                if self.ic_gate and ic_df is not None:
+                    col = f"ic_{self.ic_gate_window}d"
+                    if col in ic_df.columns and dt in ic_df.index:
+                        ic_val = ic_df[col].loc[dt]
+                        if pd.notna(ic_val) and ic_val <= 0:
+                            daily_returns.append(0.0)
+                            turnovers.append(
+                                len(prev_top) / max(len(prev_top) * 2, 1)
+                            )
+                            rebal_dates.append(dt)
+                            prev_top = set()
+                            prev_weights = None
+                            n_ic_gated += 1
+                            continue
+
                 scores = f.loc[dt].dropna()
                 if len(scores) < min_scores:
                     continue
-                top_candidates = scores.nlargest(min(20, universe_size)).index.tolist()
 
-                # 过闸: 逐个候选跑 PreTradeGate, 拒单不进组合
+                # 风险调整排序: rank by signal / past_vol 而非原始 signal
+                # 原理: Sharpe = E[r]/σ. 当两只票信号相同时, 低波动的 Sharpe 更高.
+                if self.signal_risk_adjust and ret_panel is not None:
+                    try:
+                        hist = ret_panel.loc[:dt].iloc[:-1].tail(self.cov_lookback)
+                        past_vol = hist.std().replace(0, np.nan)
+                        scores = (scores / past_vol.reindex(scores.index)).dropna()
+                        if len(scores) < min_scores:
+                            scores = f.loc[dt].dropna()   # 回退
+                    except Exception:
+                        pass
+
+                ranked = scores.sort_values(ascending=False)
+                top_slice = ranked.head(buf_n) if buf_n > top_n else ranked.head(top_n)
+                # turnover_buffer: 旧持仓若仍在 top_slice, 保留; 不足 top_n 的
+                # 缺额再从 ranked 头部补齐
+                if self.turnover_buffer > 0 and prev_top:
+                    kept = [c for c in ranked.head(buf_n).index if c in prev_top]
+                    needed = max(0, top_n - len(kept))
+                    add = [c for c in ranked.index if c not in kept][:needed]
+                    top_candidates = kept[:top_n] + add
+                else:
+                    top_candidates = ranked.head(max(top_n, 20)).index.tolist()
+
+                # Pre-Trade Gate
                 if gate is not None:
                     admitted: list = []
                     for code in top_candidates:
                         row = daily_by_code.get(code)
                         if row is None or dt not in row.index:
-                            admitted.append(code)  # 缺数据默认放行
+                            admitted.append(code)
                             continue
                         snap = row.loc[dt]
                         price = float(snap.get("close", 0))
-                        # prev_close 估算
                         if "pct_chg" in snap and price:
                             pct = float(snap.get("pct_chg", 0)) / 100
                             prev_close = price / (1 + pct) if (1 + pct) else price
@@ -455,7 +690,10 @@ class ResearchPipeline:
                             code=str(code), side="buy", shares=100,
                             price=price, prev_close=prev_close,
                         )
-                        decision = gate.check(intent, portfolio, today=dt.date() if hasattr(dt, "date") else None)
+                        decision = gate.check(
+                            intent, portfolio,
+                            today=dt.date() if hasattr(dt, "date") else None,
+                        )
                         if decision.allow:
                             admitted.append(code)
                         else:
@@ -469,13 +707,30 @@ class ResearchPipeline:
                 if len(top) == 0:
                     continue
 
-                turnover = len(set(top) ^ prev_top) / max(len(top) + len(prev_top), 1)
+                # 组合权重: equal_weight / inverse_vol / risk_parity
+                weights = self._compute_portfolio_weights(
+                    top, dt, ret_panel, self.portfolio_method, self.cov_lookback,
+                )
+
+                turnover = self._weighted_turnover(weights, prev_weights)
                 turnovers.append(turnover)
                 prev_top = set(top)
+                prev_weights = weights
 
-                label_row = label_df.loc[dt, top].mean()
-                if pd.notna(label_row):
-                    daily_returns.append(float(label_row))
+                # 加权组合收益
+                lbl_slice = label_df.loc[dt, top].reindex(top)
+                if lbl_slice.isna().all():
+                    continue
+                # NaN 视为 0, 权重按可用样本归一
+                active = lbl_slice.notna()
+                if active.sum() == 0:
+                    continue
+                w_active = weights[active]
+                if w_active.sum() > 1e-12:
+                    w_active = w_active / w_active.sum()
+                port_ret = float((lbl_slice[active] * w_active).sum())
+                daily_returns.append(port_ret)
+                rebal_dates.append(dt)
 
             if not daily_returns:
                 res.warnings.append("回测无有效样本")
@@ -484,24 +739,128 @@ class ResearchPipeline:
                 return res
 
             arr = np.array(daily_returns)
-            annual_ret = float(arr.mean() * 50)
-            annual_vol = float(arr.std() * np.sqrt(50))
+            # 年化 periods: 周频=50, 月频=12, 日频=252
+            # 使用 rebalance_freq 推断: periods = 252 / rebalance_freq
+            periods = max(1.0, 252.0 / self.rebalance_freq)
+
+            # 波动率目标 overlay (shift 1, 无前视): 用过去 N 期实现波动率 → 下期仓位缩放
+            # 原理: 波动有持续性 (GARCH), 平静期加仓/狂暴期减仓 → 在相同毛 Sharpe
+            # 下拿到更平的净值曲线. 这不制造 alpha, 它**通过压缩左尾放大 Sharpe**.
+            vol_scale_series = None
+            if self.vol_target is not None and len(arr) > self.vol_target_window:
+                s = pd.Series(arr)
+                rolling_vol = s.rolling(self.vol_target_window,
+                                          min_periods=max(5, self.vol_target_window // 2)
+                                          ).std() * np.sqrt(periods)
+                raw_scale = (self.vol_target / rolling_vol.replace(0, np.nan))
+                raw_scale = raw_scale.clip(self.vol_target_min_leverage,
+                                             self.vol_target_max_leverage)
+                # 关键: shift(1) 保证只用过去的波动估计下期仓位
+                scale = raw_scale.shift(1).fillna(1.0).values
+                arr = arr * scale
+                vol_scale_series = scale
+
+            annual_ret = float(arr.mean() * periods)
+            annual_vol = float(arr.std() * np.sqrt(periods))
             sharpe = annual_ret / (annual_vol + 1e-9)
-            max_dd = float(
-                (pd.Series(arr).cumsum() -
-                 pd.Series(arr).cumsum().cummax()).min()
-            )
+            nav = pd.Series(1 + arr).cumprod()
+            running_max = nav.cummax()
+            drawdown = (nav - running_max) / running_max
+            max_dd = float(drawdown.min())
+            res.stage_results["_bt_returns"] = arr.tolist()
+            res.stage_results["_bt_nav"] = nav.tolist()
+            res.stage_results["_bt_drawdown"] = drawdown.tolist()
+            res.stage_results["_bt_turnovers"] = list(turnovers)
+            res.stage_results["_bt_dates"] = [
+                pd.Timestamp(d).isoformat() for d in rebal_dates
+            ]
+            if vol_scale_series is not None:
+                res.stage_results["_bt_vol_scale"] = list(vol_scale_series)
             res.backtest_stats = {
                 "n_rebalances": len(daily_returns),
+                "portfolio_method": self.portfolio_method,
+                "rebalance_freq": self.rebalance_freq,
+                "top_k": top_n,
+                "signal_ema_span": self.signal_ema_span,
+                "vol_target": self.vol_target if self.vol_target else "off",
+                "signal_risk_adjust": self.signal_risk_adjust,
                 "annual_return": annual_ret,
                 "annual_vol": annual_vol,
                 "sharpe": sharpe,
                 "max_drawdown": max_dd,
                 "avg_turnover": float(np.mean(turnovers)) if turnovers else 0,
                 "gate_hard_rejects": int(n_hard_rejects),
+                "ic_gated_periods": int(n_ic_gated),
+                "final_nav": float(nav.iloc[-1]),
+                "win_rate": float((arr > 0).mean()),
+                "profit_loss_ratio": float(
+                    arr[arr > 0].mean() / abs(arr[arr < 0].mean())
+                ) if (arr < 0).any() and (arr > 0).any() else 0.0,
             }
             if gate is not None:
                 res.gate_stats = gate.stats.to_dict()
         except Exception as e:
             res.warnings.append(f"回测失败: {e}")
         return res
+
+    @staticmethod
+    def _compute_portfolio_weights(
+        codes: list,
+        dt,
+        ret_panel: pd.DataFrame | None,
+        method: str,
+        lookback: int,
+    ) -> pd.Series:
+        """按 method 计算 top-K 的组合权重 (index=codes, 和为 1).
+
+        出错一律回退到等权, 不抛异常影响回测主流程.
+        """
+        n = len(codes)
+        if n == 0:
+            return pd.Series(dtype=float)
+        if method == "equal_weight" or ret_panel is None or n < 2:
+            return pd.Series(1.0 / n, index=codes)
+
+        try:
+            hist = ret_panel.loc[:dt].iloc[:-1].tail(lookback)
+            hist = hist.reindex(columns=codes).dropna(how="all")
+            # 至少需要 lookback/2 的样本
+            if len(hist) < max(10, lookback // 2):
+                return pd.Series(1.0 / n, index=codes)
+            hist = hist.fillna(0.0)
+
+            if method == "inverse_vol":
+                vols = hist.std().replace(0, np.nan)
+                if vols.isna().all():
+                    return pd.Series(1.0 / n, index=codes)
+                from portfolio_opt import inverse_volatility_weights
+                w = inverse_volatility_weights(vols.fillna(vols.median()))
+                return w.reindex(codes).fillna(1.0 / n)
+
+            if method == "risk_parity":
+                from portfolio_opt import risk_parity_weights
+                cov = hist.cov().values
+                # 正则化避免病态
+                cov = cov + np.eye(len(cov)) * 1e-6 * np.trace(cov) / len(cov)
+                w_arr = risk_parity_weights(cov)
+                w_arr = np.nan_to_num(w_arr, nan=1.0 / n)
+                if w_arr.sum() <= 0:
+                    return pd.Series(1.0 / n, index=codes)
+                w_arr = w_arr / w_arr.sum()
+                return pd.Series(w_arr, index=codes)
+        except Exception:
+            return pd.Series(1.0 / n, index=codes)
+
+        return pd.Series(1.0 / n, index=codes)
+
+    @staticmethod
+    def _weighted_turnover(
+        curr: pd.Series, prev: pd.Series | None,
+    ) -> float:
+        """|w_curr - w_prev| / 2 = 换手的下界 (L1)."""
+        if prev is None or len(prev) == 0:
+            return 1.0
+        union = curr.index.union(prev.index)
+        c = curr.reindex(union).fillna(0.0)
+        p = prev.reindex(union).fillna(0.0)
+        return float((c - p).abs().sum() / 2.0)

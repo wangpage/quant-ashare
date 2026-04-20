@@ -13,9 +13,12 @@
 from .research import ResearchPipeline, ResearchResult
 from .daily_trading import DailyTradingPipeline, DailyDecision
 from .reporting import build_daily_report, build_research_report
+from .reporting_html import build_research_report_html
+from .reporting_compare import build_compare_report
 
 __all__ = [
     "ResearchPipeline", "ResearchResult",
     "DailyTradingPipeline", "DailyDecision",
     "build_daily_report", "build_research_report",
+    "build_research_report_html", "build_compare_report",
 ]

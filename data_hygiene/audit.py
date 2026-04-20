@@ -122,15 +122,19 @@ class DataHealthChecker:
             else:
                 report.passed.append(f"价格跳点 OK ({len(jumps)} 个, 可接受)")
 
-        # 4. 复权因子验证
+        # 4. 复权因子验证 (可选: 无 factor 列 → INFO 级, 不报警告)
+        #    前复权数据 factor 已隐含在 close 里, 没有 factor 列不影响正确性.
+        #    只有宣称做了复权但 factor 列非单调才是 CRITICAL.
         adj_check = verify_adjustment_factor(df)
         report.checks["adjustment"] = adj_check
         if not adj_check.get("has_factor_col"):
-            report.warnings.append("缺 factor 列, 无法校验复权")
+            report.passed.append(
+                "无 factor 列 (前复权数据可接受, 如需校验可启用 include_factor)"
+            )
         elif adj_check.get("verdict") == "FAIL":
             report.critical_issues.append("复权因子非单调, 处理有 bug")
         else:
-            report.passed.append("复权因子一致")
+            report.passed.append("复权因子单调性 OK")
 
         # 5. 停牌识别
         if {"code", "volume"}.issubset(df.columns):

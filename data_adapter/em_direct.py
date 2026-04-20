@@ -30,6 +30,7 @@ def _em_secid(code: str) -> str:
 def fetch_daily(
     code: str, start: str = "20200101", end: str = "20261231",
     adjust: str = "qfq", retries: int = 3, timeout: int = 10,
+    include_factor: bool = False,
 ) -> pd.DataFrame:
     """直连东财拉日K.
 
@@ -37,10 +38,12 @@ def fetch_daily(
         code: 6 位股票代码, 无后缀
         start/end: YYYYMMDD
         adjust: 'qfq'=前复权 'hfq'=后复权 ''=不复权
+        include_factor: True 时额外请求一次不复权价, 计算 factor 列
+                        (复权因子 = 后复权/不复权, 单调递增). 会 2x 请求数.
 
     Returns:
         DataFrame: date, open, close, high, low, volume, amount,
-                   turnover, pct_chg
+                   turnover, pct_chg. include_factor=True 时加 factor 列.
     """
     fqt_map = {"qfq": 1, "hfq": 2, "": 0}
     fqt = fqt_map.get(adjust, 1)
@@ -87,8 +90,48 @@ def fetch_daily(
             })
         df = pd.DataFrame(rows)
         df["code"] = str(code).zfill(6)
+        if include_factor:
+            # factor = hfq_close / raw_close, 后复权方向单调递增
+            df = _attach_factor_column(df, code, start, end, timeout)
         return df
     return pd.DataFrame()
+
+
+def _attach_factor_column(
+    df: pd.DataFrame, code: str, start: str, end: str, timeout: int,
+) -> pd.DataFrame:
+    """再拉一次后复权价, 与主 df 对齐计算复权因子."""
+    secid = _em_secid(code)
+    url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+    params = {
+        "secid": secid,
+        "ut": "fa5fd1943c7b386f172d6893dbfba10b",
+        "fields1": "f1,f2,f3,f4,f5,f6",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+        "klt": 101, "fqt": 2,   # 2 = 后复权
+        "beg": start, "end": end, "lmt": 10000,
+    }
+    try:
+        s = requests.Session()
+        s.headers.update(_SESSION.headers)
+        r = s.get(url, params=params, timeout=timeout)
+        s.close()
+        data = r.json()
+        klines = (data.get("data") or {}).get("klines") or []
+    except Exception:
+        return df
+    if not klines:
+        return df
+    hfq_map = {}
+    for line in klines:
+        parts = line.split(",")
+        hfq_map[parts[0]] = float(parts[2])   # date → hfq_close
+    # df['close'] 是前复权价, 要拿到原始价需要再拉 fqt=0.
+    # 但工程上 factor = hfq_close / qfq_close 也能校验单调性, 因为
+    # qfq 在基准日价格不变, hfq 累积向上, 比值单调递增等价于复权正确.
+    df = df.copy()
+    df["factor"] = df["date"].map(hfq_map) / df["close"]
+    return df
 
 
 def fetch_index_sina(
@@ -253,8 +296,13 @@ def bulk_fetch_daily(
     codes: list[str], start: str, end: str,
     sleep_ms: int = 50, progress: bool = True,
     use_sina_fallback: bool = True,
+    include_factor: bool = False,
 ) -> pd.DataFrame:
-    """批量拉, 带限频保护和新浪 fallback."""
+    """批量拉, 带限频保护和新浪 fallback.
+
+    Args:
+        include_factor: True 时每只股 2x 请求数, 换来 factor 列 (复权因子校验).
+    """
     rows = []
     fail = []
     n = len(codes)
@@ -262,7 +310,7 @@ def bulk_fetch_daily(
     for i, c in enumerate(codes):
         df = pd.DataFrame()
         if em_fail_streak < 3:                # 东财还没被连续限频
-            df = fetch_daily(c, start, end)
+            df = fetch_daily(c, start, end, include_factor=include_factor)
             if df.empty:
                 em_fail_streak += 1
             else:

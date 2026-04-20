@@ -12,7 +12,10 @@ import pandas as pd
 from data_adapter.em_direct import (
     bulk_fetch_daily, fetch_index_daily, fetch_hot_stocks,
 )
-from pipeline import ResearchPipeline, build_research_report
+from pipeline import (
+    ResearchPipeline, build_research_report,
+    build_research_report_html,
+)
 from utils.logger import logger
 
 
@@ -58,7 +61,8 @@ def main(n_stocks: int = 20, start: str = "20230101", end: str = "20260420"):
     # 2. 拉日线
     print(f"\n[2/4] 拉日线数据 ({start} - {end})...")
     t0 = time.time()
-    daily_df = bulk_fetch_daily(codes, start, end, sleep_ms=80)
+    daily_df = bulk_fetch_daily(codes, start, end, sleep_ms=80,
+                                  include_factor=True)
     print(f"  耗时 {time.time()-t0:.1f}s, 总记录 {len(daily_df)} 行")
 
     if daily_df.empty:
@@ -94,12 +98,17 @@ def main(n_stocks: int = 20, start: str = "20230101", end: str = "20260420"):
     report = build_research_report(result)
     print("\n" + report)
 
-    # 保存
-    out_path = Path(__file__).resolve().parent.parent / "output" / \
-               f"research_{time.strftime('%Y%m%d_%H%M')}.md"
-    out_path.parent.mkdir(exist_ok=True)
-    out_path.write_text(report, encoding="utf-8")
-    print(f"\n报告保存: {out_path}")
+    # 保存 Markdown + HTML 两种格式
+    ts = time.strftime("%Y%m%d_%H%M")
+    out_dir = Path(__file__).resolve().parent.parent / "output"
+    out_dir.mkdir(exist_ok=True)
+    md_path = out_dir / f"research_{ts}.md"
+    html_path = out_dir / f"research_{ts}.html"
+    md_path.write_text(report, encoding="utf-8")
+    build_research_report_html(result, out_path=html_path)
+    print(f"\n📝 Markdown: {md_path}")
+    print(f"🌐 HTML 交互报告: {html_path}")
+    print(f"   浏览器打开: open {html_path}")
 
     # 如有 qlib 可继续接入 LightGBM, 这里先用自有的 research pipeline
     return result
