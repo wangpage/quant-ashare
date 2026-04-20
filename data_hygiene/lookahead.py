@@ -49,6 +49,9 @@ def scan_lookahead_bias(
     f = clean_features.loc[common_idx]
     l = labels.loc[common_idx]
 
+    # drop_ratio 分母下限: 低于此值的相关性本身就是噪音, 比值无意义
+    CORR_FLOOR = 0.05
+
     for col in f.columns:
         corr_now = f[col].corr(l, method="spearman")
         corr_shifted = f[col].shift(1).corr(l, method="spearman")
@@ -56,14 +59,13 @@ def scan_lookahead_bias(
         if pd.isna(corr_now) or pd.isna(corr_shifted):
             continue
 
-        # 判定
         if abs(corr_now) < threshold_corr:
             continue
 
-        if abs(corr_now) > 0:
-            drop_ratio = 1 - abs(corr_shifted) / abs(corr_now)
-        else:
-            drop_ratio = 0
+        # 数值稳定: 分母 floor, 避免 corr_now ≈ 0 时 drop_ratio 爆炸产生误判
+        denom = max(abs(corr_now), CORR_FLOOR)
+        drop_ratio = 1 - abs(corr_shifted) / denom
+        drop_ratio = float(np.clip(drop_ratio, -1.0, 1.0))
 
         severity = "LOW"
         reasons = []

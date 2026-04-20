@@ -10,14 +10,16 @@
 from __future__ import annotations
 
 import asyncio
+import random
 import time
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
 import yaml
 
-from utils.config import PROJECT_ROOT
+from utils.config import PROJECT_ROOT, load_config
 from utils.logger import logger
 
 from .parser import Level2Parser
@@ -34,6 +36,8 @@ class Level2Stats:
     l1_market: int = 0
     l1_flow: int = 0
     parse_errors: int = 0
+    out_of_order: int = 0           # 序号或时间戳逆序的消息
+    clock_drift_ms_max: float = 0.0  # 服务器-本地时钟最大漂移
     total_latency_ms: float = 0.0
     max_latency_ms: float = 0.0
     start_ts: float = 0.0
@@ -56,11 +60,48 @@ class Level2Stats:
         return self.total_latency_ms / max(self.total, 1)
 
 
+class _SequenceGuard:
+    """按 (topic_prefix, code) 维度检查消息序号 + 时间戳单调性.
+
+    A 股 Level2 因 UDP 重传 / 多路复用偶有乱序, 微结构因子 (VPIN / OIR /
+    Kyle's λ) 对时序敏感, 乱序不检测会让信号含噪.
+
+    策略: 维护每路最后的 (main_seq, sub_seq, server_time_ms), 新消息三者
+    任意维度回退即视为乱序 → 计数 + 告警, 由调用方决定是否丢弃.
+    """
+
+    def __init__(self, warn_every: int = 500):
+        self._last: dict[tuple, tuple[int, int, int]] = {}
+        self._ooo_count: dict[tuple, int] = defaultdict(int)
+        self._warn_every = warn_every
+
+    def check(self, stream: str, code: str,
+              main_seq: int, sub_seq: int, server_time_ms: int) -> bool:
+        """返回 True = 正常有序; False = 乱序."""
+        key = (stream, code)
+        cur = (int(main_seq or 0), int(sub_seq or 0), int(server_time_ms or 0))
+        last = self._last.get(key)
+        self._last[key] = cur
+        if last is None:
+            return True
+        # 序号或时间戳任一维度回退 = 乱序
+        if cur < last:
+            self._ooo_count[key] += 1
+            n = self._ooo_count[key]
+            if n == 1 or n % self._warn_every == 0:
+                logger.warning(
+                    f"乱序 {stream}/{code}: last={last} cur={cur} (累计 {n})"
+                )
+            return False
+        return True
+
+
 class Level2NatsClient:
-    def __init__(self, config_path: str | Path | None = None):
+    def __init__(self, config_path: str | Path | None = None,
+                 drop_out_of_order: bool = False):
         path = Path(config_path) if config_path else PROJECT_ROOT / "config" / "level2.yaml"
-        with open(path, "r", encoding="utf-8") as f:
-            self.cfg = yaml.safe_load(f)
+        # 用 load_config 以展开 ${ENV:-default}, 避免凭证硬编码
+        self.cfg = load_config(path)
 
         self.parser = Level2Parser("csv")
         self.trans_buf = RingBuffer(200_000)
@@ -75,6 +116,11 @@ class Level2NatsClient:
             "trans": None, "order": None, "rapid": None,
             "simple": None, "depth": None,
         }
+        self._seq_guard = _SequenceGuard()
+        self._drop_ooo = drop_out_of_order
+        # 时钟漂移滚动样本 (服务器 ms - 本地 ms), 用于早期识别时间源异常
+        self._drift_samples: deque = deque(maxlen=256)
+        self._last_drift_warn_ts = 0.0
 
     # ---------- 回调 ----------
     def on_trade(self, fn):  self._cb["trans"] = fn
@@ -85,7 +131,12 @@ class Level2NatsClient:
     def on_book(self, fn):   self._cb["simple"] = fn          # 旧 API
 
     # ---------- 连接 ----------
-    async def connect(self):
+    async def connect(self, *, max_retries: int = 6,
+                      base_backoff: float = 1.0, max_backoff: float = 30.0):
+        """带指数退避的连接. 断线由 nats 库自身的重连接管, 这里只管首次握手.
+
+        退避序列: 1s, 2s, 4s, 8s, 16s, 30s (带 ±25% jitter 防惊群).
+        """
         import nats
 
         conn = self.cfg["connection"]
@@ -95,10 +146,15 @@ class Level2NatsClient:
         urls = [u for u in urls if u and "TODO" not in u]
         auth = conn["auth"]
 
+        if not auth.get("user") or not auth.get("password"):
+            raise RuntimeError(
+                "Level2 凭证为空: 请设置环境变量 LEVEL2_USER / LEVEL2_PASSWORD "
+                "或使用测试账号默认值"
+            )
+
         # 文档示例格式: nats://user:pass@host:port
         urls_with_auth = []
         for u in urls:
-            # 如果 URL 已含 @, 不重复注入
             if "@" in u.split("//")[-1]:
                 urls_with_auth.append(u)
             else:
@@ -106,18 +162,37 @@ class Level2NatsClient:
                     u.replace("nats://", f"nats://{auth['user']}:{auth['password']}@")
                 )
 
-        self._nc = await nats.connect(
-            servers=urls_with_auth,
-            connect_timeout=conn["timeout_seconds"],
-            ping_interval=conn["ping_interval"],
-            max_reconnect_attempts=conn["max_reconnect"],
-            reconnect_time_wait=conn["reconnect_wait"],
-            error_cb=self._on_err,
-            disconnected_cb=self._on_disc,
-            reconnected_cb=self._on_reconn,
-            closed_cb=self._on_close,
-        )
-        logger.info(f"NATS 已连接: {active} / user={auth['user']}")
+        last_err: Exception | None = None
+        for attempt in range(max_retries):
+            try:
+                self._nc = await nats.connect(
+                    servers=urls_with_auth,
+                    connect_timeout=conn["timeout_seconds"],
+                    ping_interval=conn["ping_interval"],
+                    max_reconnect_attempts=conn["max_reconnect"],
+                    reconnect_time_wait=conn["reconnect_wait"],
+                    error_cb=self._on_err,
+                    disconnected_cb=self._on_disc,
+                    reconnected_cb=self._on_reconn,
+                    closed_cb=self._on_close,
+                )
+                logger.info(
+                    f"NATS 已连接: {active} / user={auth['user']} "
+                    f"(尝试 {attempt + 1}/{max_retries})"
+                )
+                return
+            except Exception as e:
+                last_err = e
+                if attempt == max_retries - 1:
+                    break
+                wait = min(base_backoff * (2 ** attempt), max_backoff)
+                wait *= random.uniform(0.75, 1.25)  # jitter
+                logger.warning(
+                    f"NATS 连接失败 ({attempt + 1}/{max_retries}): {e}; "
+                    f"{wait:.1f}s 后重试"
+                )
+                await asyncio.sleep(wait)
+        raise RuntimeError(f"NATS 连接重试耗尽: {last_err}")
 
     async def _on_err(self, e):      logger.error(f"NATS err: {e}")
     async def _on_disc(self):        logger.warning("NATS 断开")
@@ -160,11 +235,53 @@ class Level2NatsClient:
         self.stats.total_latency_ms += abs(lat)
         self.stats.max_latency_ms = max(self.stats.max_latency_ms, abs(lat))
 
+    def _track_drift(self, server_ms: int, recv_ns: int):
+        """跟踪服务器-本地时钟漂移 (差值的中位数 vs 瞬时差).
+
+        单条消息差值 = 网络延迟 + 时钟漂移, 不可分离; 但 rolling 中位数
+        是网络延迟的一阶近似, 极端值 (> 5s) 多来自本地时钟错乱 (如容器
+        未同步 NTP). A 股微结构因子对相对时序敏感而非绝对时序, 所以我们
+        只监控、不尝试修正.
+        """
+        drift = recv_ns / 1e6 - server_ms
+        self._drift_samples.append(drift)
+        if abs(drift) > self.stats.clock_drift_ms_max:
+            self.stats.clock_drift_ms_max = abs(drift)
+        # 每 30s 检查一次是否需要告警
+        now = time.time()
+        if now - self._last_drift_warn_ts < 30:
+            return
+        if len(self._drift_samples) < 32:
+            return
+        self._last_drift_warn_ts = now
+        sorted_samples = sorted(self._drift_samples)
+        median = sorted_samples[len(sorted_samples) // 2]
+        # 5 秒以上中位漂移几乎肯定是时钟错乱, 非网络延迟
+        if abs(median) > 5000:
+            logger.error(
+                f"时钟漂移异常: median={median:.0f}ms (>5s), "
+                f"检查本地 NTP 同步. 微结构因子将受影响"
+            )
+
+    def _record(self, stream: str, code: str, main_seq: int, sub_seq: int,
+                server_ms: int, recv_ns: int) -> bool:
+        """统一入口: 更新延迟 / 时钟 / 乱序统计. 返回是否应处理该消息."""
+        self._track_drift(server_ms, recv_ns)
+        ordered = self._seq_guard.check(stream, code, main_seq, sub_seq, server_ms)
+        if not ordered:
+            self.stats.out_of_order += 1
+            if self._drop_ooo:
+                return False
+        return True
+
     async def _h_trans(self, msg):
         recv = time.time_ns()
         t = self.parser.parse_trans(msg.data, recv)
         if not t:
             self.stats.parse_errors += 1
+            return
+        if not self._record("trans", t.code, t.main_seq, t.sub_seq,
+                            t.server_time_ms, recv):
             return
         self.stats.trans += 1
         self._update_latency(t.latency_ms)
@@ -179,6 +296,10 @@ class Level2NatsClient:
         if not o:
             self.stats.parse_errors += 1
             return
+        if not self._record("order", o.code,
+                            getattr(o, "main_seq", 0), getattr(o, "sub_seq", 0),
+                            getattr(o, "server_time_ms", 0), recv):
+            return
         self.stats.order += 1
         self._update_latency(o.latency_ms)
         self.order_buf.push(o)
@@ -191,6 +312,9 @@ class Level2NatsClient:
         r = self.parser.parse_rapid(msg.data, recv)
         if not r:
             self.stats.parse_errors += 1
+            return
+        if not self._record("rapid", r.code, 0, 0,
+                            getattr(r, "server_time_ms", 0), recv):
             return
         self.stats.rapid += 1
         self._update_latency(r.latency_ms)
@@ -205,6 +329,9 @@ class Level2NatsClient:
         if not s:
             self.stats.parse_errors += 1
             return
+        if not self._record("simple", s.code, 0, 0,
+                            getattr(s, "server_time_ms", 0), recv):
+            return
         self.stats.simple += 1
         self._update_latency(s.latency_ms)
         self.simple_buf.push(s)
@@ -217,6 +344,9 @@ class Level2NatsClient:
         d = self.parser.parse_depth(msg.data, recv)
         if not d:
             self.stats.parse_errors += 1
+            return
+        if not self._record("depth", d.code, 0, 0,
+                            getattr(d, "server_time_ms", 0), recv):
             return
         self.stats.depth += 1
         self._update_latency(d.latency_ms)

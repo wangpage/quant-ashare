@@ -6,7 +6,9 @@
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-不是又一个抄 Alpha158 的项目. 本项目实现了 **15 个头部私募在用但很少公开的圈内技巧**, 覆盖从数据清洗到执行层的完整量化链路. 详见 [ADVANCED_TRICKS.md](ADVANCED_TRICKS.md).
+不是又一个抄 Alpha158 的项目. 本项目致力于实现 **头部私募在用但很少公开的圈内技巧**, 覆盖从数据清洗到执行层的完整量化链路.
+
+**当前状态**: 已实装 9 个核心模块, 规划 15 个. 实装清单见 [功能矩阵](#-已实装-vs-规划功能矩阵), 详解见 [ADVANCED_TRICKS.md](ADVANCED_TRICKS.md).
 
 ---
 
@@ -19,9 +21,9 @@
 ├─────────────────────────────────────────────────────────┤
 │  qlib 核心 + Alpha158 + 35 A股特化因子                   │
 ├─────────────────────────────────────────────────────────┤
-│  【圈内暗门 9 大模块】                                     │
+│  【圈内暗门 9 大模块 - 已实装】                             │
 │  标签工程 / 微结构因子 / 因子衰减监控 / 事件屏蔽              │
-│  Barra 中性化 / 组合优化 / 数据清洗 / 执行层 / Pipeline     │
+│  Barra 中性化 / 组合优化 / 数据清洗 / 主题投资 / 执行层       │
 ├─────────────────────────────────────────────────────────┤
 │  数据源: akshare + 东财/新浪直连 + Level2 NATS            │
 ├─────────────────────────────────────────────────────────┤
@@ -37,19 +39,29 @@
 - 三分析师并行 (asyncio), 延迟降 3x
 - 支持 **Claude / GPT / DeepSeek / Kimi / Qwen / GLM** 统一后端
 
-### 📊 15 个头部私募内部 tricks
-| # | 技巧 | 大众盲点 → 本项目实现 |
-|---|---|---|
-| 1 | 标签工程 | `close/close` → 多 horizon + vol 归一化 + CSRank |
-| 2 | 涨跌停屏蔽 | 全量训练 → 自动屏蔽 (回测 IC 虚高 20-30%) |
-| 3 | Level2 微结构 alpha | OIR / **VPIN** / Cancel Ratio / Kyle's λ |
-| 4 | 冲击成本建模 | 固定 2bps → **Almgren-Chriss + sqrt 律** |
-| 5 | Barra 风格中性化 | Size+Industry → **CNE5 六风格因子** |
-| 6 | 因子衰减监控 | 训完不管 → rolling IC 自动下线 |
-| 7 | 组合优化 | Top-K 等权 → **风险平价 + Black-Litterman** |
-| 8 | 事件屏蔽 | 无 → 解禁/财报/大宗自动屏蔽 |
-| 9 | Regime 自适应 | 固定策略 → 8 种市场状态 + 仓位乘数 |
-| ... | | 详见 [ADVANCED_TRICKS.md](ADVANCED_TRICKS.md) |
+### 📊 已实装 vs 规划功能矩阵
+
+✅ = 已有代码 + 测试覆盖; 🚧 = 规划 / 骨架; ❌ = 仅文档提及
+
+| # | 技巧 | 状态 | 大众盲点 → 本项目实现 |
+|---|---|:---:|---|
+| 1 | 标签工程 | ✅ | `close/close` → 多 horizon + vol 归一化 + CSRank + **停牌/一字板屏蔽** |
+| 2 | 涨跌停 / 停牌屏蔽 | ✅ | 全量训练 → 自动屏蔽 (回测 IC 虚高 20-30%) |
+| 3 | Level2 微结构 alpha | ✅ | OIR / **VPIN** / Cancel Ratio / Kyle's λ |
+| 4 | 冲击成本建模 | ✅ | 固定 2bps → **Almgren-Chriss + sqrt 律** |
+| 5 | Barra 风格中性化 | ✅ | Size+Industry → **CNE5 六风格因子** |
+| 6 | 因子衰减监控 | ✅ | 训完不管 → rolling IC 自动下线 |
+| 7 | 组合优化 | ✅ | Top-K 等权 → **风险平价 + Black-Litterman** |
+| 8 | 事件屏蔽 | ✅ | 无 → 解禁/财报/大宗自动屏蔽 |
+| 9 | 数据清洗 | ✅ | 幸存者 / 前视 / 复权 (含**小幅分红/累计漂移**) |
+| 10 | 主题投资识别 | ✅ | 纯涨幅 → 萌芽/扩散/拥挤三阶段 + 龙头排序 |
+| 11 | Regime 自适应 | 🚧 | 8 种市场状态 + 仓位乘数 (骨架已有) |
+| 12 | Level2 时序保护 | ✅ | 指数退避 / 时钟漂移监控 / 乱序检测 |
+| 13 | 资金流前瞻 | 🚧 | 主力资金 + 北向资金领先信号 (规划中) |
+| 14 | 涨停连板因子 | ❌ | 连板高度 + 炸板概率 (规划中) |
+| 15 | 龙虎榜游资特征 | ❌ | 知名营业部联动图 (规划中) |
+
+详解见 [ADVANCED_TRICKS.md](ADVANCED_TRICKS.md). 进度会随每次 release 更新.
 
 ### 🧬 记忆与自进化
 - **Memory Curator**: 每笔交易后 LLM 提炼反思存 SQLite + FTS5
@@ -86,6 +98,25 @@ git clone https://github.com/wangpage/quant-ashare.git
 cd quant-ashare
 pip install -r requirements.txt
 ```
+
+### 🌐 启动 Web UI (推荐)
+
+最快看到项目效果的方式. 自带 4 个交互页面:
+- **📡 今日信号仪表盘** - 大盘 regime + 主题评分 + top-K 信号 + 资金分配
+- **🔍 个股详情** - K 线 / 因子画像 / 主题归属
+- **🧠 Agent 辩论记录** - 三分析师 + Bull vs Bear + 交易员 + 风控
+- **📈 回测与策略曲线** - 净值 / 回撤 / IC 衰减 / Barra 分解
+
+```bash
+# 默认 Mock 模式, 无需任何配置即可体验
+bash scripts/run_webapp.sh
+# 浏览器打开 http://localhost:8501
+
+# 接真实数据 (需要配置 akshare / LLM API)
+QUANT_WEB_MODE=real bash scripts/run_webapp.sh
+```
+
+![webapp 架构](./README.md)
 
 ### 运行测试套件 (219 个)
 

@@ -10,9 +10,11 @@ connection:
       backup: "nats://db.base32.cn:31886"
   active: "shanghai"          # 华东就近, 如在华南改 guangzhou
 
+  # 凭证从环境变量读取; 默认值为 base32.cn 公开测试账号 (仅支持 300750 / 600519)
+  # 生产环境: export LEVEL2_USER=xxx LEVEL2_PASSWORD=xxx
   auth:
-    user: "level2_test"
-    password: "level2@test"
+    user: "${LEVEL2_USER:-level2_test}"
+    password: "${LEVEL2_PASSWORD:-level2@test}"
 
   timeout_seconds: 10
   ping_interval: 20
@@ -81,5 +83,6 @@ clickhouse:
     host: "43.143.73.95"
     tcp_port: 31888
     http_port: 31889
-  user: "REPLACE_WITH_REAL"
-  password: "REPLACE_WITH_REAL"
+  # 凭证从环境变量读取, 未设置时为空 → 连接失败会显式报错 (避免占位符静默进生产)
+  user: "${CLICKHOUSE_USER:-}"
+  password: "${CLICKHOUSE_PASSWORD:-}"
