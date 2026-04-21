@@ -265,6 +265,40 @@ test_* 函数总数: 46 个
 
 ---
 
+## 🔔 每日自动化 (Cron + 飞书通知)
+
+**三件套**(每日 15:30 自动跑,3 分钟完成):
+
+1. **[scripts/cron_daily.py](scripts/cron_daily.py)**: 编排器
+   - 数据增量(daily_data_updater)→ Paper Trade(paper_trade_runner)→ Git push → 飞书通知
+   - 任一环节失败会发错误告警到飞书
+
+2. **[scripts/install_cron.sh](scripts/install_cron.sh)**: 一键安装 crontab
+   ```bash
+   bash scripts/install_cron.sh         # 安装
+   bash scripts/install_cron.sh --dry-run
+   bash scripts/install_cron.sh --uninstall
+   ```
+   默认配置:
+   - 交易日 15:30 → 数据更新 + paper trade + 飞书通知
+   - 周日 20:00 → leak detector 自检(如果回测管道被破立刻告警)
+
+3. **飞书通知示例**:
+   ```
+   📊 A股 Paper Trade 2026-04-21
+   • NAV: ¥123.1 万 (初始 ¥100 万)
+   • 累计: +23.06%  持仓 25 只
+   • 当日 P&L: ¥+47099
+   Top 5 持仓: #1 600683, #2 003018, ...
+   ```
+
+**依赖**:
+- [lark-cli](https://github.com/larksuite/lark-cli) (飞书发消息)
+- 首次用 `lark-cli auth login` 授权,开机 open_id 自动查
+- 环境变量可覆盖:`LARK_USER_OPEN_ID=ou_xxxxx`
+
+---
+
 ## 🔬 研究档案 (V6-V8 严格 OOS 实验)
 
 **[scripts/run_holdout_v6.py](scripts/run_holdout_v6.py)**: B+ 自适应极性 (IC z-score + 显著性过滤 + 惯性 + 横截面归一化), 暴露了早期版本的 label leak.
