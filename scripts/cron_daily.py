@@ -190,17 +190,16 @@ def main_daily(args):
 
         # 1. 数据更新
         if not args.skip_data:
-            log("\n── 1/4 数据增量更新 ──", logfile)
+            log("\n── 1/5 数据增量更新 ──", logfile)
             rc, out = run_cmd(
                 ["python3", "scripts/daily_data_updater.py"],
                 logfile, timeout=1800,
             )
             if rc != 0:
                 log(f"⚠️  data updater 失败 (rc={rc}), 继续用旧缓存", logfile)
-                # 不 abort, paper trade 还能用旧数据
 
         # 2. paper trade
-        log("\n── 2/4 Paper Trade Runner ──", logfile)
+        log("\n── 2/5 Paper Trade Runner ──", logfile)
         rc, out = run_cmd(
             ["python3", "scripts/paper_trade_runner.py"],
             logfile, timeout=1200,
@@ -209,24 +208,36 @@ def main_daily(args):
             log(f"❌ paper trade 失败, 发送错误通知", logfile)
             send_lark(build_error_report("paper_trade_runner", out),
                        user_id, args.dry_run_lark)
-            return 1
+            # paper trade 失败不阻断 watchlist signal, 继续
 
-        # 3. git push
-        log("\n── 3/4 Git Commit + Push ──", logfile)
+        # 3. watchlist signal (专业买卖信号, 独立于 paper trade)
+        log("\n── 3/5 Watchlist 量化信号 ──", logfile)
+        ws_cmd = ["python3", "scripts/watchlist_signal.py"]
+        if args.dry_run_lark:
+            ws_cmd.append("--dry-run-lark")
+        rc_ws, out_ws = run_cmd(ws_cmd, logfile, timeout=600)
+        if rc_ws != 0:
+            log(f"⚠️  watchlist signal 失败 (rc={rc_ws})", logfile)
+            send_lark(build_error_report("watchlist_signal", out_ws),
+                       user_id, args.dry_run_lark)
+        # watchlist_signal.py 内部会自己发飞书, 这里不重复发
+
+        # 4. git push
+        log("\n── 4/5 Git Commit + Push ──", logfile)
         if not args.skip_push:
             ok = git_commit_push(logfile, dry_run=False)
             if not ok:
-                log(f"⚠️  git push 失败, 但 paper trade 成功", logfile)
+                log(f"⚠️  git push 失败", logfile)
 
-        # 4. 飞书通知
-        log("\n── 4/4 飞书通知 ──", logfile)
+        # 5. paper trade 账户通知 (和 watchlist 分开, 两条不同视角)
+        log("\n── 5/5 Paper Trade 账户通知 ──", logfile)
         account_path = PAPER / "account.json"
         if account_path.exists():
             acc = json.loads(account_path.read_text(encoding="utf-8"))
             report = build_report(acc)
             send_lark(report, user_id, args.dry_run_lark)
         else:
-            log(f"⚠️  无 account.json, 跳过通知", logfile)
+            log(f"⚠️  无 account.json, 跳过账户通知", logfile)
 
         log(f"\n✅ Cron daily 完成 @ {datetime.now().strftime('%H:%M:%S')}", logfile)
         return 0

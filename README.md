@@ -270,8 +270,31 @@ test_* 函数总数: 46 个
 **三件套**(每日 15:30 自动跑,3 分钟完成):
 
 1. **[scripts/cron_daily.py](scripts/cron_daily.py)**: 编排器
-   - 数据增量(daily_data_updater)→ Paper Trade(paper_trade_runner)→ Git push → 飞书通知
+   - 数据增量(daily_data_updater) → Paper Trade(paper_trade_runner) → **Watchlist 信号**(watchlist_signal) → Git push → 飞书通知
    - 任一环节失败会发错误告警到飞书
+
+   **[scripts/watchlist_signal.py](scripts/watchlist_signal.py)**: 自选池专业信号(独立于 paper trade 账户)
+   - Universe: [config/user_watchlist.yaml](config/user_watchlist.yaml) (63 只半导体/军工/新材料/稀金)
+   - 7 因子合成: REV_5/REV_20/MOM_126_21/LOW_VOL_60/TURN_Z_60/MAX_RET_5/AMIHUD_60
+   - 输出分级: 🟩强买入 (z≥1.5) / 🟢买入 (0.75-1.5) / 🟡减仓 / 🟥清仓
+   - 带建议仓位% + 参考股数(按 100 万资金)+ 因子主导维度
+   - 飞书消息样例:
+     ```
+     ⚡ 量化 Alpha 信号 — 2026-04-21
+     Universe: 63 只自选池 | 参考资金 ¥100 万
+     截面: z中位 +0.14  强正 14  强负 12
+
+     🟩 强买入
+       • 中航西飞 ¥24.79  z=+1.57  建议 4%仓 ≈ 1600 股  [+REV_5]
+       • 中国中铁 ¥5.30   z=+1.54  建议 4%仓 ≈ 7600 股  [+REV_20]
+
+     🟢 买入
+       • 中国重汽 ¥23.59  z=+1.47  建议 3%仓 ≈ 1200 股  [+REV_5]
+       ...
+     🟥 清仓
+       • 云南锗业 ¥68.20  z=-1.96  [-REV_5]
+       ...
+     ```
 
 2. **[scripts/install_cron.sh](scripts/install_cron.sh)**: 一键安装 crontab
    ```bash
