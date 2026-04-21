@@ -29,6 +29,7 @@ from data_adapter.insider import build_insider_features, INSIDER_FACTOR_NAMES
 from factors.alpha_pandas import compute_pandas_alpha
 from factors.alpha_reversal import compute_advanced_alpha
 from factors.alpha_limit import compute_limit_alpha, LIMIT_FACTOR_NAMES
+from factors.alpha_regime import compute_market_regime, REGIME_FACTOR_NAMES
 from factors.adaptive_polarity import apply_adaptive_polarity
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -36,26 +37,38 @@ CACHE = ROOT / "cache"
 
 TRAIN_END = pd.Timestamp("2024-12-31")
 TEST_START = pd.Timestamp("2025-01-01")
-HORIZON = 30
+HORIZON = 5    # 极致缩短: 模型 lag 仅 1 周
 
 
-def rolling_predict_holdout(X, y, train_days=252, train_end=TRAIN_END):
-    """Hold-out 严格: 只用 ≤ train_end 的数据训练最后一次, 预测全部 hold-out."""
+def rolling_predict_holdout(X, y, train_days=252, train_end=TRAIN_END,
+                              horizon=HORIZON):
+    """Hold-out 严格: 只用 ≤ train_end - horizon 的 label 训练 (防 future leak).
+
+    🔒 Fix: 真实场景 t=train_end 时, 只能观测到 t-horizon 之前的 label.
+    所以训练样本 t ≤ train_end - horizon, 后 horizon 天的 label 还没实现.
+    """
     dates = X.index.get_level_values("date").unique().sort_values()
     train_dates = dates[dates <= train_end]
     test_dates = dates[dates > train_end]
 
     # 训练期 rolling OOS
-    print(f"\n[训练期 rolling] train≤{train_end.date()}")
+    print(f"\n[训练期 rolling] train≤{train_end.date()}, label_cutoff = train_end - {horizon}d")
     preds_tr = []
     step = 21
     i = train_days
     while i < len(train_dates):
         j = min(i + step, len(train_dates))
         tr_s, tr_e = train_dates[i - train_days], train_dates[i - 1]
+        # 🔒 label cutoff: 训练样本 t 必须满足 t + horizon ≤ tr_e
+        label_cutoff_dates = train_dates[train_dates <= tr_e]
+        if len(label_cutoff_dates) <= horizon:
+            i = j; continue
+        label_cutoff = label_cutoff_dates[-(horizon + 1)]   # tr_e - horizon 个交易日
+
         te_s, te_e = train_dates[i], train_dates[j - 1]
         try:
-            X_tr = X.loc[tr_s:tr_e]; y_tr = y.loc[tr_s:tr_e]
+            X_tr = X.loc[tr_s:label_cutoff]   # 关键: 用 label_cutoff 而非 tr_e
+            y_tr = y.loc[tr_s:label_cutoff]
             mask = y_tr.notna() & X_tr.notna().all(axis=1)
             X_tr, y_tr = X_tr[mask], y_tr[mask]
             if len(X_tr) < 1000:
@@ -69,14 +82,15 @@ def rolling_predict_holdout(X, y, train_days=252, train_end=TRAIN_END):
     pred_train = (pd.concat(preds_tr).sort_index() if preds_tr
                    else pd.Series(dtype=float))
 
-    # Hold-out: 用最终训练集一次训练
+    # Hold-out: 严格防 leak, 训练截止 train_end - horizon
     print(f"\n[Hold-out] test>{train_end.date()}")
-    tr_e = train_end
+    tr_e_label = train_dates[-(horizon + 1)]
     tr_s = train_dates[max(0, len(train_dates) - train_days)]
-    X_tr = X.loc[tr_s:tr_e]; y_tr = y.loc[tr_s:tr_e]
+    X_tr = X.loc[tr_s:tr_e_label]
+    y_tr = y.loc[tr_s:tr_e_label]
     mask = y_tr.notna() & X_tr.notna().all(axis=1)
     X_tr, y_tr = X_tr[mask], y_tr[mask]
-    print(f"  训练集 [{tr_s.date()}→{tr_e.date()}] n={len(X_tr)}")
+    print(f"  训练集 [{tr_s.date()}→{tr_e_label.date()}] (label cutoff) n={len(X_tr)}")
     m = _fit_model(X_tr, y_tr)
     X_te = X.loc[test_dates[0]:test_dates[-1]]
     pred_ho = pd.Series(m.predict(X_te.values), index=X_te.index)
@@ -119,17 +133,26 @@ def main():
     feat_z = feat_combo.groupby(level="date").transform(_z).clip(-3, 3).fillna(0)
     print(f"  特征 {feat_z.shape}")
 
+    # V7: regime 因子不走 IC 聚类/自适应极性 (全局信号 截面 IC=0)
+    # 单独保存, 后续直接 concat 到最终训练集
+    feat_regime = compute_market_regime(daily)
+    print(f"  regime 因子 {feat_regime.shape}: {REGIME_FACTOR_NAMES}")
+
     # 2. Label
     print("\n[2/5] 条件 Label (horizon=30, dd 惩罚)...")
     label = make_conditional_label(daily, horizon=HORIZON, dd_clip=0.25)
 
-    # 3. 先做 IC 聚类 (只用训练集)
-    print(f"\n[3/5] IC 聚类 (只用训练集)...")
+    # 3. IC 聚类 (只用训练集 + label 截止 train_end - horizon)
+    print(f"\n[3/5] IC 聚类 (label_cutoff = train_end - {HORIZON}d)...")
     aligned = feat_z.join(label.rename("label"), how="inner")
     valid = aligned["label"].notna() & aligned.drop(columns="label").notna().all(axis=1)
     feat_valid = aligned.drop(columns="label")[valid]
     y_valid = aligned["label"][valid]
-    train_mask = feat_valid.index.get_level_values("date") <= TRAIN_END
+    # 🔒 防 leak: IC 用 ≤ train_end - horizon 的 label
+    all_train_dates = feat_valid.index.get_level_values("date").unique().sort_values()
+    all_train_dates = all_train_dates[all_train_dates <= TRAIN_END]
+    ic_cutoff = all_train_dates[-(HORIZON + 1)]
+    train_mask = feat_valid.index.get_level_values("date") <= ic_cutoff
     selected = ic_cluster_select(feat_valid[train_mask], y_valid[train_mask],
                                   corr_threshold=0.6, min_ic=0.005)
     feat_valid = feat_valid[selected]
@@ -147,6 +170,10 @@ def main():
     feat_adapt = feat_adapt[~all_zero]
     y_valid = y_valid.loc[feat_adapt.index]
     print(f"  自适应后有效样本 {len(feat_adapt)}")
+
+    # V7: 在这里 join regime 因子, LightGBM 树能学 regime × factor 的交互
+    feat_adapt = feat_adapt.join(feat_regime, how="left").fillna(0)
+    print(f"  加入 regime 后特征 {feat_adapt.shape}")
 
     # 5. 训练 + hold-out
     print(f"\n[5/5] 训练 + Hold-out...")
@@ -168,7 +195,7 @@ def main():
     # 回测
     print("\n" + "="*64 + "\n  训练期 回测\n" + '='*64)
     stats_tr = backtest_v4(pred_tr, daily, top_ratio=0.05,
-                            rebalance_days=30, vol_target=0.20)
+                            rebalance_days=HORIZON, vol_target=0.20)
     for k, v in stats_tr.items():
         if isinstance(v, float):
             if any(s in k for s in ["return","drawdown","vol","turnover"]):
@@ -182,7 +209,7 @@ def main():
 
     print("\n" + "="*64 + "\n  🔒 Hold-out 回测 (2025~2026.4)\n" + '='*64)
     stats_ho = backtest_v4(pred_ho, daily, top_ratio=0.05,
-                            rebalance_days=30, vol_target=0.20)
+                            rebalance_days=HORIZON, vol_target=0.20)
     for k, v in stats_ho.items():
         if isinstance(v, float):
             if any(s in k for s in ["return","drawdown","vol","turnover"]):

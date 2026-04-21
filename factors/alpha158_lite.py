@@ -216,11 +216,18 @@ def combine_factors_rolling_ic(
     window: int = 60,
     top_k: int = 8,
     min_abs_ic: float = 0.02,
+    label_horizon: int = 10,
 ) -> pd.DataFrame:
-    """Rolling window IC 加权合成 (无前视偏差).
+    """Rolling window IC 加权合成 (严格无前视偏差).
 
-    每日 t 用 [t-window, t-1] 的 IC 决定因子权重, 应用到 t 日. 这样
-    因子方向会随市场 regime 切换而自动调整.
+    ⚠️ Leak 修复 (2026-04): label_horizon 参数强制把训练窗口后推 H 天.
+    原先 win = [i-window, i-1] 的最后 H 天, label.loc[i-1] 是 [i-1, i-1+H]
+    的 forward return, 要求知道今天及之后 H-1 天的价格 → **未来函数**.
+    修后: win = [i-window-H, i-1-H], 保证窗口内每个标签的 forward-window
+    结束 <= i-1, 即"昨天及之前". 无任何未来信息.
+
+    每日 t 用 shift 后的 IC 决定因子权重, 应用到 t 日. 这样因子方向会随
+    市场 regime 切换而自动调整.
 
     Args:
         feature_df: MultiIndex (factor, code)
@@ -228,6 +235,8 @@ def combine_factors_rolling_ic(
         window: IC 回溯天数 (太短噪声大, 太长跟不上 regime 切换)
         top_k: 每日保留 |IC| 最大的 K 个因子
         min_abs_ic: |IC| 阈值
+        label_horizon: label 的 forward horizon (天), 用于防泄露 shift.
+                       默认 10 = 与 multi_horizon_label 最大 horizon 匹配.
 
     Returns:
         composite signal DataFrame (date × code).
@@ -236,7 +245,9 @@ def combine_factors_rolling_ic(
         return feature_df
 
     common_idx = feature_df.index.intersection(label_df.index)
-    if len(common_idx) < window + 30:
+    H = max(1, int(label_horizon))
+    # 至少要 window + H + 30 个样本, 否则回退等权
+    if len(common_idx) < window + H + 30:
         return combine_factors_equal_weight(feature_df)
 
     factor_names = list(feature_df.columns.get_level_values(0).unique())
@@ -253,10 +264,12 @@ def combine_factors_rolling_ic(
 
     factor_selection_log = []
     for i, dt in enumerate(common_idx):
-        if i < window:
+        # 需要 i >= window + H 才有合法的无泄露窗口
+        if i < window + H:
             composite.loc[dt] = np.nan
             continue
-        win_dates = common_idx[i - window : i]
+        # ⚠️ 关键修复: 窗口后推 H 天, 保证窗口内最新 label 也落在 <= dt-1
+        win_dates = common_idx[i - window - H : i - H]
         # 各因子在窗口内的 IC
         ic_map = {}
         for f in factor_names:

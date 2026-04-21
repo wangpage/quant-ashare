@@ -429,8 +429,11 @@ class ResearchPipeline:
                 )
                 label_df = res.stage_results.get("_label_df")
                 if label_df is not None and not label_df.empty:
+                    # ⚠️ label_horizon 必须 >= label_horizons 的最大值, 防未来函数
+                    max_H = max(self.label_horizons) if self.label_horizons else 10
                     signal = combine_factors_rolling_ic(
                         feat_df, label_df, window=60, top_k=8,
+                        label_horizon=max_H,
                     )
                     last_log = signal.attrs.get("selection_log", [])
                     last_factors = last_log[-1]["top_5"] if last_log else []
