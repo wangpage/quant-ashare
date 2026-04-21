@@ -80,7 +80,11 @@ def append_trade_log(trade: dict):
 
 # ---------- 定价查询 ----------
 def load_daily_cache() -> pd.DataFrame:
-    kline_path = CACHE / "kline_20230101_20260420_n500.parquet"
+    """找 cache 里最新的全市场 kline_*_n500.parquet."""
+    candidates = sorted([p for p in CACHE.glob("kline_*_n500.parquet")])
+    if not candidates:
+        raise FileNotFoundError("未找到 kline_*_n500.parquet 全市场缓存")
+    kline_path = candidates[-1]
     df = pd.read_parquet(kline_path)
     df["date"] = pd.to_datetime(df["date"])
     return df
@@ -177,6 +181,67 @@ def mark_to_market(acc: dict, daily: pd.DataFrame, dt: pd.Timestamp) -> dict:
     }
 
 
+def compute_ma5(daily: pd.DataFrame, code: str,
+                 before: pd.Timestamp) -> float | None:
+    """读近 5 个交易日(含 before 当日)的 close 均值."""
+    sub = daily[(daily["code"] == code) & (daily["date"] <= before)]
+    if len(sub) < 5:
+        return None
+    return float(sub.sort_values("date").tail(5)["close"].mean())
+
+
+def stop_loss_sell(acc: dict, daily: pd.DataFrame, dt: pd.Timestamp) -> float:
+    """硬止损: T+1 开盘卖出 (亏 ≥ 5% 或 close < MA5).
+
+    检查基准是 dt 前一日的收盘价 (paper 不假设日内 tick 成交).
+    卖出按 dt 的开盘价执行.
+    """
+    total_pnl = 0.0
+    # 前一交易日
+    all_dates = sorted(daily["date"].unique())
+    prev_td = next((d for d in reversed(all_dates) if d < dt), None)
+    if prev_td is None:
+        return 0.0
+
+    to_sell = []
+    for code, pos in list(acc["positions"].items()):
+        # 买入当日不能卖 (T+1)
+        if pd.Timestamp(pos["buy_date"]) >= dt:
+            continue
+        close_prev = get_price(daily, code, prev_td, "close")
+        if close_prev is None:
+            continue
+        loss_pct = (close_prev - pos["cost"]) / pos["cost"]
+        ma5 = compute_ma5(daily, code, prev_td)
+
+        reasons = []
+        if loss_pct <= -0.05:
+            reasons.append(f"hard_stop_5pct (亏 {loss_pct:.1%})")
+        if ma5 is not None and close_prev < ma5:
+            reasons.append(f"break_ma5 (收 {close_prev:.2f} < MA5 {ma5:.2f})")
+        if reasons:
+            to_sell.append((code, reasons))
+
+    for code, reasons in to_sell:
+        pos = acc["positions"][code]
+        p = get_price(daily, code, dt, "open")
+        if p is None:
+            p = get_latest_close(daily, code, dt)
+            src = "fallback_close"
+        else:
+            src = "open"
+        if p is None:
+            continue
+        reason = "|".join(reasons) + f"|exec={src}"
+        pnl = execute_sell(acc, code, p, pos["shares"], dt, reason)
+        total_pnl += pnl
+    if to_sell:
+        print(f"  🛑 硬止损卖出 {len(to_sell)} 只, PnL {total_pnl:+.0f}")
+        for code, reasons in to_sell:
+            print(f"     {code}: {' & '.join(reasons)}")
+    return total_pnl
+
+
 def sell_expired(acc: dict, daily: pd.DataFrame, dt: pd.Timestamp) -> float:
     """T+1 开盘卖出: 持仓到期 (target_exit ≤ dt) 的全部卖出."""
     total_pnl = 0.0
@@ -237,6 +302,9 @@ def run_one_day(asof: pd.Timestamp, top: pd.Series, daily: pd.DataFrame,
         mtm = mark_to_market(acc, daily, asof)
         acc["equity_history"].append(mtm)
         return
+
+    # 硬止损优先 (亏 5% 或破 MA5 → T+1 开盘卖)
+    stop_loss_sell(acc, daily, next_td)
 
     # 卖出到期 (按 T+1 open)
     sell_expired(acc, daily, next_td)
