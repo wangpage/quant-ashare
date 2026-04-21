@@ -41,6 +41,8 @@ PAPER = ROOT / "output" / "paper_trade"
 
 
 BACKEND_MODELS = {
+    "qwen":      "qwen-plus",
+    "dashscope": "qwen-plus",
     "deepseek":  "deepseek-chat",
     "anthropic": "claude-haiku-4-5",
     "mock":      "mock",
@@ -246,8 +248,8 @@ def send_lark(md: str) -> bool:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--top", type=int, default=10, help="取前 N 只做 LLM 分析")
-    ap.add_argument("--backend", default=os.getenv("LLM_BACKEND", "deepseek"),
-                    choices=["deepseek", "anthropic", "mock"])
+    ap.add_argument("--backend", default=os.getenv("LLM_BACKEND", "qwen"),
+                    choices=["qwen", "dashscope", "deepseek", "anthropic", "mock"])
     ap.add_argument("--dry-run-lark", action="store_true")
     ap.add_argument("--concurrency", type=int, default=3)
     args = ap.parse_args()
