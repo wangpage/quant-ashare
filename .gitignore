@@ -18,3 +18,5 @@ mlruns/
 .DS_Store
 .idea/
 .vscode/
+*.bak
+*.bak_*
