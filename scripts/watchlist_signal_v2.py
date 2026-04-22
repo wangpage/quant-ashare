@@ -45,6 +45,7 @@ from data_adapter.minute_kline import bulk_fetch_minute
 from factors.alpha_limit import compute_limit_alpha
 from factors.seat_network import compute_seat_alpha
 from factors.alpha_intraday import compute_real_intraday_alpha
+from factors.sector_momentum import compute_sector_momentum, load_universe_kline
 
 ROOT = Path(__file__).resolve().parent.parent
 LARK_BIN = "/opt/homebrew/bin/lark-cli"
@@ -87,15 +88,26 @@ INTRADAY_WEIGHTS = {
     # 日中穿越次数越多 = 多空焦灼, 中性偏负
     "R_MID_CROSS":   -0.3,
 }
+SECTOR_WEIGHTS = {
+    # 板块动量 + 为正向 (邻居近期涨 → 本票有机会)
+    "SECTOR_MOM_5":   1.0,
+    # 昨日单日板块动量, 捕捉隔夜延续
+    "SECTOR_MOM_1":   0.5,
+    # 板块离散度 - 越大说明邻居涨跌不一, 不是真板块行情
+    "SECTOR_DISP_5": -0.3,
+}
+# 基础权重: 反转 打板 席位 合计 1.00
 CATEGORY_WEIGHTS_BASE = {
-    "reversal": 0.40,
-    "limit":    0.40,
-    "seat":     0.20,
+    "reversal": 0.35,
+    "limit":    0.35,
+    "seat":     0.15,
+    "sector":   0.15,   # 板块动量 (2026-04-22 引入, 复盘显示 IC +0.22)
 }
 CATEGORY_WEIGHTS_WITH_INTRADAY = {
-    "reversal": 0.30,
-    "limit":    0.35,
-    "seat":     0.20,
+    "reversal": 0.25,
+    "limit":    0.30,
+    "seat":     0.15,
+    "sector":   0.15,
     "intraday": 0.15,
 }
 
@@ -230,15 +242,23 @@ def weighted_rank_score(df: pd.DataFrame, weights: dict) -> pd.Series:
 def synthesize_composite(rev_df: pd.DataFrame,
                           limit_slice: pd.DataFrame,
                           seat_slice: pd.DataFrame,
-                          intraday_slice: pd.DataFrame | None = None
+                          intraday_slice: pd.DataFrame | None = None,
+                          sector_slice: pd.DataFrame | None = None,
                           ) -> pd.DataFrame:
-    """复合 alpha_z + 主导大类. intraday_slice 可选 (启用 --use-minute 时)."""
+    """复合 alpha_z + 主导大类. intraday_slice/sector_slice 可选."""
     codes = rev_df.index
     out = rev_df.copy()
 
     use_intraday = intraday_slice is not None and not intraday_slice.empty
+    use_sector = sector_slice is not None and not sector_slice.empty
     cat_weights = (CATEGORY_WEIGHTS_WITH_INTRADAY if use_intraday
-                   else CATEGORY_WEIGHTS_BASE)
+                   else CATEGORY_WEIGHTS_BASE).copy()
+
+    # 若 sector 不可用, 把 sector 权重等比分回 reversal/limit
+    if not use_sector and "sector" in cat_weights:
+        w_sector = cat_weights.pop("sector")
+        cat_weights["reversal"] += w_sector * 0.5
+        cat_weights["limit"] += w_sector * 0.5
 
     rev_score, _ = weighted_rank_score(rev_df, REVERSAL_WEIGHTS)
     out["rev_score"] = rev_score
@@ -273,6 +293,16 @@ def synthesize_composite(rev_df: pd.DataFrame,
     else:
         intra_score = None
 
+    if use_sector:
+        sec_aligned = sector_slice.reindex(codes)
+        sector_score, _ = weighted_rank_score(sec_aligned, SECTOR_WEIGHTS)
+        for f in SECTOR_WEIGHTS:
+            if f in sec_aligned.columns:
+                out[f] = sec_aligned[f]
+        out["sector_score"] = sector_score
+    else:
+        sector_score = None
+
     def _z(s):
         mu, sd = s.mean(), s.std()
         return (s - mu) / (sd + 1e-9)
@@ -289,6 +319,10 @@ def synthesize_composite(rev_df: pd.DataFrame,
         intra_z = _z(intra_score)
         composite = composite + intra_z * cat_weights["intraday"]
 
+    if use_sector:
+        sec_z = _z(sector_score)
+        composite = composite + sec_z * cat_weights["sector"]
+
     out["alpha_z"] = _z(composite)
 
     contrib_cols = {
@@ -298,6 +332,8 @@ def synthesize_composite(rev_df: pd.DataFrame,
     }
     if use_intraday:
         contrib_cols["日内"] = intra_z * cat_weights["intraday"]
+    if use_sector:
+        contrib_cols["板块"] = sec_z * cat_weights["sector"]
     contrib = pd.DataFrame(contrib_cols, index=codes)
     out["top_category"] = contrib.abs().idxmax(axis=1)
     out["cat_sign"] = contrib.apply(
@@ -450,6 +486,98 @@ def prepare_minute_for_intraday(minute_df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def compute_signals_df(
+    codes: list[str],
+    daily: pd.DataFrame | None = None,
+    use_minute: bool = False,
+    quiet: bool = True,
+) -> pd.DataFrame:
+    """给 predict_tomorrow / 外部调用方用的公开函数.
+
+    和 main() 等价的因子合成流程, 但不拉飞书、不打印进度、不写文件.
+
+    Args:
+        codes: 6 位股票代码列表
+        daily: DataFrame (code, date, OHLC, volume...), None 时自动 fetch
+        use_minute: 是否启用 5 分钟级日内因子 (耗时 1-3 分钟)
+        quiet: 不打印进度
+
+    Returns:
+        DataFrame 索引=code, 列含 alpha_z/rev_score/limit_score/seat_score/
+        top_category/cat_sign/latest_close/latest_date, 按 alpha_z 降序.
+        空 DataFrame 表示没数据可算.
+    """
+    def _log(msg):
+        if not quiet:
+            print(msg)
+
+    if daily is None:
+        daily = fetch_watchlist_kline(codes, days_back=180)
+    if daily is None or daily.empty:
+        return pd.DataFrame()
+
+    # 反转因子
+    rev_df = compute_reversal_panel(daily)
+    if rev_df.empty:
+        return pd.DataFrame()
+
+    asof = daily["date"].max()
+
+    # 打板
+    try:
+        limit_panel = compute_limit_alpha(daily)
+        limit_slice = latest_slice(limit_panel, asof)
+    except Exception as e:
+        _log(f"⚠️ 打板因子失败: {e}")
+        limit_slice = pd.DataFrame()
+
+    # 席位
+    lhb_df = load_lhb()
+    if lhb_df is not None:
+        try:
+            trading_dates = pd.DatetimeIndex(sorted(daily["date"].unique()))
+            seat_panel = compute_seat_alpha(lhb_df, trading_dates)
+            seat_slice = latest_slice(seat_panel, asof)
+        except Exception as e:
+            _log(f"⚠️ 席位因子失败: {e}")
+            seat_slice = pd.DataFrame()
+    else:
+        seat_slice = pd.DataFrame()
+
+    # 板块
+    sector_slice = pd.DataFrame()
+    try:
+        universe_kline = load_universe_kline(CACHE)
+        sector_df = compute_sector_momentum(
+            daily, universe_kline,
+            as_of=pd.Timestamp(asof),
+            lookback=5, n_neighbors=15, corr_window=60,
+        )
+        sector_slice = sector_df[list(SECTOR_WEIGHTS.keys())]
+    except Exception as e:
+        _log(f"⚠️ 板块动量因子失败: {e}")
+        sector_slice = pd.DataFrame()
+
+    # 日内 (可选)
+    intraday_slice = pd.DataFrame()
+    if use_minute:
+        try:
+            minute_df = fetch_minute_data(codes, days_back=30)
+            if not minute_df.empty:
+                minute_df = prepare_minute_for_intraday(minute_df)
+                intraday_panel = compute_real_intraday_alpha(minute_df)
+                intraday_slice = latest_slice(intraday_panel, asof)
+        except Exception as e:
+            _log(f"⚠️ 日内因子失败: {e}")
+            intraday_slice = pd.DataFrame()
+
+    return synthesize_composite(
+        rev_df, limit_slice, seat_slice,
+        intraday_slice if use_minute else None,
+        sector_slice if not sector_slice.empty else None,
+    )
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run-lark", action="store_true")
@@ -503,6 +631,23 @@ def main():
         print("  ⚠️ 未找到龙虎榜缓存, 席位因子=0")
         seat_slice = pd.DataFrame()
 
+    # 板块动量因子 (基于相关性邻居, 不依赖外部板块数据)
+    sector_slice = pd.DataFrame()
+    try:
+        universe_kline = load_universe_kline(CACHE)
+        sector_df = compute_sector_momentum(
+            daily, universe_kline,
+            as_of=pd.Timestamp(asof),
+            lookback=5, n_neighbors=15, corr_window=60,
+        )
+        # 包装成 daily 列: SECTOR_MOM_1/5/DISP_5, 代码为 index
+        sector_slice = sector_df[list(SECTOR_WEIGHTS.keys())]
+        print(f"  板块动量因子: {sector_slice.shape} "
+              f"(MOM_5 均值 {sector_slice['SECTOR_MOM_5'].mean():+.2f}%)")
+    except Exception as e:
+        print(f"  ⚠️ 板块动量因子失败 ({e}), 跳过")
+        sector_slice = pd.DataFrame()
+
     # 分钟级日内因子 (可选)
     intraday_slice = pd.DataFrame()
     if args.use_minute:
@@ -521,8 +666,11 @@ def main():
             intraday_slice = pd.DataFrame()
 
     # 合成
-    sig = synthesize_composite(rev_df, limit_slice, seat_slice,
-                                intraday_slice if args.use_minute else None)
+    sig = synthesize_composite(
+        rev_df, limit_slice, seat_slice,
+        intraday_slice if args.use_minute else None,
+        sector_slice if not sector_slice.empty else None,
+    )
     print(f"\n  复合 alpha_z Top 5:")
     for code, r in sig.head(5).iterrows():
         print(f"    {name_map.get(code, code):<8} ¥{r['latest_close']:>7.2f}  "
@@ -548,6 +696,8 @@ def main():
     out_path = out_dir / f"{datetime.now():%Y-%m-%d}.csv"
     score_cols = ["latest_close", "alpha_z", "top_category", "cat_sign",
                   "rev_score", "limit_score", "seat_score"]
+    if "sector_score" in sig.columns:
+        score_cols.append("sector_score")
     if "intraday_score" in sig.columns:
         score_cols.append("intraday_score")
     sig_out = sig[score_cols].copy()
