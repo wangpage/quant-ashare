@@ -164,7 +164,7 @@ python3 tests/test_advanced_tricks.py                 # 6 暗门 55/55
 
 ```bash
 # 拉 10 只蓝筹股 + 2 年数据 + 跑完整 pipeline (含 Barra)
-python3 scripts/run_real_research.py --n 10 --start 20240101 --end 20260420
+python3 scripts/run_real_research_v5.py --n 10 --start 20240101 --end 20260420
 
 # 输出: annual_return, sharpe, max_drawdown + 完整报告
 # 保存: output/research_YYYYMMDD_HHMM.md
@@ -343,7 +343,7 @@ test_* 函数总数: 46 个
 
 **[data_adapter/fundflow.py](data_adapter/fundflow.py)**: 主力资金流 (akshare 个股近 120 日明细).
 
-**[scripts/daily_paper_trade.py](scripts/daily_paper_trade.py)**: 每日自动化 paper trade - top 25 信号 + Qwen 解释 + 持仓档案.
+**[scripts/paper_trade_runner.py](scripts/paper_trade_runner.py)**: 每日自动化 paper trade - 维护真账户 + T+1 买卖 + 硬止损(亏 5%/破 MA5)+ 持仓档案.
 
 ---
 
