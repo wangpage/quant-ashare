@@ -1,8 +1,11 @@
 """llm_shortline_pick — 读 watchlist_signal_v2 top N 信号, 调 LLM 做短线决策.
 
-默认 backend: DeepSeek (便宜, ~0.003¥/次), 可切:
-    LLM_BACKEND=anthropic python3 scripts/llm_shortline_pick.py
-    LLM_BACKEND=deepseek  python3 scripts/llm_shortline_pick.py  (默认)
+默认 backend: qwen (便宜). 可切:
+    LLM_BACKEND=anthropic   python3 scripts/llm_shortline_pick.py
+    LLM_BACKEND=deepseek    python3 scripts/llm_shortline_pick.py
+    LLM_BACKEND=gpt5-mini   python3 scripts/llm_shortline_pick.py   # 智增增代理 gpt-5.4-mini
+    LLM_BACKEND=gemini3     python3 scripts/llm_shortline_pick.py   # 智增增代理 gemini-3-flash-preview
+    LLM_BACKEND=zhizengzeng LLM_MODEL=gpt-5.4-mini python3 ...      # 手动指定模型
 
 输出:
     - 每只股: action(buy/watch/avoid) + 止损位 + 止盈位 + 一句总结
@@ -41,12 +44,17 @@ CACHE = ROOT / "cache"
 PAPER = ROOT / "output" / "paper_trade"
 
 
-BACKEND_MODELS = {
-    "qwen":      "qwen-plus",
-    "dashscope": "qwen-plus",
-    "deepseek":  "deepseek-chat",
-    "anthropic": "claude-haiku-4-5",
-    "mock":      "mock",
+# (cli_backend, default_model) → 运行时 (backend, model) 二元组.
+# 别名 gpt5-mini / gemini3 走智增增代理, 同一 ZHIZENGZENG_API_KEY
+BACKEND_MODELS: dict[str, tuple[str, str]] = {
+    "qwen":        ("qwen",        "qwen-plus"),
+    "dashscope":   ("dashscope",   "qwen-plus"),
+    "deepseek":    ("deepseek",    "deepseek-chat"),
+    "anthropic":   ("anthropic",   "claude-haiku-4-5"),
+    "zhizengzeng": ("zhizengzeng", "gpt-5.4-mini"),
+    "gpt5-mini":   ("zhizengzeng", "gpt-5.4-mini"),
+    "gemini3":     ("zhizengzeng", "gemini-3-flash-preview"),
+    "mock":        ("mock",        "mock"),
 }
 
 
@@ -251,12 +259,17 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--top", type=int, default=10, help="取前 N 只做 LLM 分析")
     ap.add_argument("--backend", default=os.getenv("LLM_BACKEND", "qwen"),
-                    choices=["qwen", "dashscope", "deepseek", "anthropic", "mock"])
+                    choices=list(BACKEND_MODELS.keys()))
+    ap.add_argument("--model", default=os.getenv("LLM_MODEL"),
+                    help="覆盖 backend 默认 model, 例: --backend zhizengzeng --model gemini-3-flash-preview")
     ap.add_argument("--dry-run-lark", action="store_true")
     ap.add_argument("--concurrency", type=int, default=3)
     args = ap.parse_args()
 
-    print(f"\n{'='*64}\n  🧠 LLM 短线 {datetime.now():%Y-%m-%d %H:%M} ({args.backend})\n{'='*64}")
+    real_backend, default_model = BACKEND_MODELS[args.backend]
+    model = args.model or default_model
+    print(f"\n{'='*64}\n  🧠 LLM 短线 {datetime.now():%Y-%m-%d %H:%M} "
+          f"({args.backend} → {real_backend}/{model})\n{'='*64}")
 
     sig = load_latest_v2_signal()
     sent = load_latest_sentiment()
@@ -266,7 +279,7 @@ def main():
     stats_map = load_kline_stats(top_df.index.tolist())
     print(f"  K 线统计: {len(stats_map)} 只")
 
-    backend = _LLMBackend(args.backend, BACKEND_MODELS[args.backend])
+    backend = _LLMBackend(real_backend, model)
 
     # 并发调用
     decisions = []

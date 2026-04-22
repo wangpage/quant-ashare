@@ -450,7 +450,9 @@ def llm_decision(pos: dict, quote: dict, pattern: dict, minute_df: pd.DataFrame)
 <RISK>1 条风险</RISK>
 """
     try:
-        backend = _LLMBackend("qwen", "qwen-plus")
+        backend_name = os.getenv("INTRADAY_BACKEND", "qwen")
+        model_name = os.getenv("INTRADAY_MODEL", "qwen-plus")
+        backend = _LLMBackend(backend_name, model_name)
         raw = backend.chat(prompt, max_tokens=500)
         return {
             "action": (xp.extract_tag(raw, "ACTION") or "hold_all").strip().lower(),
