@@ -49,17 +49,22 @@ class _LLMBackend:
         OPENAI_API_KEY / OPENAI_BASE_URL
         DEEPSEEK_API_KEY, MOONSHOT_API_KEY, DASHSCOPE_API_KEY, ZHIPUAI_API_KEY
         OPENROUTER_API_KEY
+        ZHIZENGZENG_API_KEY   # 智增增代理, 一个 key 覆盖 GPT/Gemini/Claude, 文档 https://doc.zhizengzeng.com/
     """
 
+    # 智增增文档: base_url 默认 /v1 就是 OpenAI 兼容格式, 能同时走 GPT 和 Gemini
+    # (原生 Gemini/Claude 走 /google 和 /anthropic, 这里不用).
     _OPENAI_COMPATIBLE = {
-        "deepseek":   ("DEEPSEEK_API_KEY",   "https://api.deepseek.com/v1"),
-        "moonshot":   ("MOONSHOT_API_KEY",   "https://api.moonshot.cn/v1"),
-        "kimi":       ("MOONSHOT_API_KEY",   "https://api.moonshot.cn/v1"),
-        "qwen":       ("DASHSCOPE_API_KEY",  "https://dashscope.aliyuncs.com/compatible-mode/v1"),
-        "dashscope":  ("DASHSCOPE_API_KEY",  "https://dashscope.aliyuncs.com/compatible-mode/v1"),
-        "zhipu":      ("ZHIPUAI_API_KEY",    "https://open.bigmodel.cn/api/paas/v4"),
-        "glm":        ("ZHIPUAI_API_KEY",    "https://open.bigmodel.cn/api/paas/v4"),
-        "openrouter": ("OPENROUTER_API_KEY", "https://openrouter.ai/api/v1"),
+        "deepseek":    ("DEEPSEEK_API_KEY",    "https://api.deepseek.com/v1"),
+        "moonshot":    ("MOONSHOT_API_KEY",    "https://api.moonshot.cn/v1"),
+        "kimi":        ("MOONSHOT_API_KEY",    "https://api.moonshot.cn/v1"),
+        "qwen":        ("DASHSCOPE_API_KEY",   "https://dashscope.aliyuncs.com/compatible-mode/v1"),
+        "dashscope":   ("DASHSCOPE_API_KEY",   "https://dashscope.aliyuncs.com/compatible-mode/v1"),
+        "zhipu":       ("ZHIPUAI_API_KEY",     "https://open.bigmodel.cn/api/paas/v4"),
+        "glm":         ("ZHIPUAI_API_KEY",     "https://open.bigmodel.cn/api/paas/v4"),
+        "openrouter":  ("OPENROUTER_API_KEY",  "https://openrouter.ai/api/v1"),
+        "zhizengzeng": ("ZHIZENGZENG_API_KEY", "https://api.zhizengzeng.com/v1"),
+        "zzz":         ("ZHIZENGZENG_API_KEY", "https://api.zhizengzeng.com/v1"),
     }
 
     def __init__(self, backend: str = "anthropic",
@@ -67,6 +72,14 @@ class _LLMBackend:
         self.backend = backend
         self.model = model
         self._client = None
+
+    def _token_kwargs(self, max_tokens: int) -> dict:
+        """GPT-5 / o1 / o3 / Gemini-3 等推理类模型只认 max_completion_tokens,
+        其余模型继续用 max_tokens. token 预算要留足够给 reasoning 过程."""
+        m = self.model.lower()
+        if any(p in m for p in ("gpt-5", "gpt5", "o1-", "o1.", "o3-", "o3.", "gemini-3")):
+            return {"max_completion_tokens": max_tokens}
+        return {"max_tokens": max_tokens}
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=10))
     def chat(self, prompt: str, max_tokens: int = 1500) -> str:
@@ -92,7 +105,7 @@ class _LLMBackend:
             r = self._client.chat.completions.create(
                 model=self.model,
                 messages=[{"role": "user", "content": prompt}],
-                max_tokens=max_tokens,
+                **self._token_kwargs(max_tokens),
             )
             return r.choices[0].message.content
 
@@ -111,7 +124,7 @@ class _LLMBackend:
             r = self._client.chat.completions.create(
                 model=self.model,
                 messages=[{"role": "user", "content": prompt}],
-                max_tokens=max_tokens,
+                **self._token_kwargs(max_tokens),
             )
             return r.choices[0].message.content
 
@@ -155,6 +168,7 @@ class TradingAgentTeam:
         self.fundamental = _LLMBackend(backend, analyst_model)
         self.technical   = _LLMBackend(backend, analyst_model)
         self.sentiment   = _LLMBackend(backend, analyst_model)
+        self.event       = _LLMBackend(backend, analyst_model)
         self.bull        = _LLMBackend(backend, researcher_model)
         self.bear        = _LLMBackend(backend, researcher_model)
         self.judge       = _LLMBackend(backend, researcher_model)
@@ -195,21 +209,51 @@ class TradingAgentTeam:
         return {**xp.extract_solution(raw), "_raw": raw,
                 "view": xp.extract_view(raw)}
 
+    def analyze_event(self, code: str, name: str, radar_summary: str) -> dict:
+        """第 4 路分析师: 基于 radar_worker 产出的事件证据做独立判断.
+
+        失败 / 无证据时返回 neutral 占位, 保证 gather 不崩.
+        """
+        if not radar_summary or "无该股" in radar_summary:
+            radar_summary = radar_summary or "(无 radar 证据)"
+        try:
+            p = prompts.EVENT_ANALYST_PROMPT.format(
+                code=code, name=name, radar_summary=radar_summary,
+            )
+            raw = self.event.chat(p)
+            return {**xp.extract_solution(raw), "_raw": raw,
+                    "view": xp.extract_view(raw)}
+        except Exception as e:
+            logger.warning(f"[{code}] event_analyst 失败, 返回 neutral: {e}")
+            return {
+                "solution": "neutral: 事件分析失败, 无信号",
+                "view": "neutral",
+                "score": 0.0,
+                "conviction": 0.0,
+                "action": "hold",
+                "_raw": "",
+                "_error": str(e),
+            }
+
     # ---------- 研究员多轮辩论 ----------
-    def debate(self, code: str, fund: dict, tech: dict, sent: dict) -> dict:
+    def debate(self, code: str, fund: dict, tech: dict, sent: dict,
+               event: dict | None = None) -> dict:
         debate_log = []
 
+        event_solution = (event or {}).get("solution") or "(无事件信号)"
         bull_p = prompts.RESEARCHER_INITIAL_BULL_PROMPT.format(
             code=code,
             fundamental_view=fund.get("solution", ""),
             technical_view=tech.get("solution", ""),
             sentiment_view=sent.get("solution", ""),
+            event_view=event_solution,
         )
         bear_p = prompts.RESEARCHER_INITIAL_BEAR_PROMPT.format(
             code=code,
             fundamental_view=fund.get("solution", ""),
             technical_view=tech.get("solution", ""),
             sentiment_view=sent.get("solution", ""),
+            event_view=event_solution,
         )
         bull_raw = self.bull.chat(bull_p)
         bear_raw = self.bear.chat(bear_p)
@@ -304,11 +348,22 @@ class TradingAgentTeam:
         indicators: str, sentiment_data: str,
         portfolio_state: dict, macro_signals: dict,
         memory_recall: dict | None = None,
+        radar_summary: str | None = None,
     ) -> AgentDecision:
+        """
+        radar_summary:
+          None  → 不启用 event_analyst, 走原 3 路辩论 (行为和改动前完全一致)
+          ""    → 启用但证据空, event_analyst 输出 neutral 占位
+          "..." → 正常走 event_analyst
+        """
         m = memory_recall or {}
-        logger.info(f"[{code}] 启动多智能体决策 (并行分析师)")
+        use_event = radar_summary is not None
+        logger.info(
+            f"[{code}] 启动多智能体决策 "
+            f"({'4 路, 含 event' if use_event else '3 路 analyst'})"
+        )
 
-        # 1. 三分析师并行 (asyncio.to_thread 包 sync 调用)
+        # 1. 分析师并行 (asyncio.to_thread 包 sync 调用)
         fund_task = asyncio.to_thread(
             self.analyze_fundamental, code, name, fundamentals,
             m.get("fundamental", "无"),
@@ -321,10 +376,23 @@ class TradingAgentTeam:
             self.analyze_sentiment, code, name, sentiment_data,
             m.get("sentiment", "无"),
         )
-        fund, tech, sent = await asyncio.gather(fund_task, tech_task, sent_task)
+        if use_event:
+            event_task = asyncio.to_thread(
+                self.analyze_event, code, name, radar_summary or "",
+            )
+            fund, tech, sent, event = await asyncio.gather(
+                fund_task, tech_task, sent_task, event_task,
+            )
+        else:
+            fund, tech, sent = await asyncio.gather(
+                fund_task, tech_task, sent_task,
+            )
+            event = None
 
-        # 2. 多轮辩论
-        researcher = await asyncio.to_thread(self.debate, code, fund, tech, sent)
+        # 2. 多轮辩论 (event 为 None 时 debate 里按默认占位处理)
+        researcher = await asyncio.to_thread(
+            self.debate, code, fund, tech, sent, event,
+        )
         conviction = researcher.get("conviction") or 0.5
         score = researcher.get("score") or 0.0
 
@@ -361,14 +429,18 @@ class TradingAgentTeam:
             reasoning=f"{researcher.get('explanation', '')} | {trade.get('explanation', '')}",
             conviction=conviction,
             score=score,
-            analyst_views={"fundamental": fund, "technical": tech,
-                           "sentiment": sent, "research": researcher},
+            analyst_views={
+                "fundamental": fund, "technical": tech,
+                "sentiment": sent, "event": event,
+                "research": researcher,
+            },
             debate_log=researcher.get("debate_log", []),
             risk_decision=risk.get("action", "approve"),
             raw_traces={
                 "fundamental": fund.get("_raw"),
                 "technical": tech.get("_raw"),
                 "sentiment": sent.get("_raw"),
+                "event": (event or {}).get("_raw"),
                 "researcher": researcher.get("_raw"),
                 "trader": trade.get("_raw"),
                 "risk": risk.get("_raw"),

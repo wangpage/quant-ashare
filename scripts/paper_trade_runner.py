@@ -324,9 +324,19 @@ def run_one_day(asof: pd.Timestamp, top: pd.Series, daily: pd.DataFrame,
           f"(现金 {mtm['cash']/1e4:.1f} 万, 持仓 {mtm['n_positions']} 只)")
 
 
-def generate_signal_today(asof: pd.Timestamp, daily: pd.DataFrame) -> pd.Series:
-    """用当前缓存生成 asof 的 top-K 信号.
-    复用 run_holdout_v6 的核心逻辑, 但只跑最后一个窗口.
+def generate_signal_today(asof: pd.Timestamp, daily: pd.DataFrame,
+                            return_full_pred: bool = False) -> tuple:
+    """用当前缓存生成 asof 的 top-K 信号(或全 universe pred).
+
+    Args:
+        asof: 基准日期 (通常是今日 EOD)
+        daily: 全市场 kline DataFrame
+        return_full_pred: False (默认, 向后兼容) → 返回 (top-K Series, sig_date)
+                          True → 返回 (完整 pred Series, sig_date), 给
+                          predict_tomorrow 用来对任意 code list 打分
+
+    Returns:
+        (pred_or_top_series, sig_date)
     """
     # 导入这里延后以减少启动开销
     from scripts.run_real_research_v5 import (
@@ -437,6 +447,8 @@ def generate_signal_today(asof: pd.Timestamp, daily: pd.DataFrame) -> pd.Series:
     X_te = feat_adapt.xs(asof_used, level="date", drop_level=True)
     pred = pd.Series(model.predict(X_te.values), index=X_te.index)
     pred.index.name = "code"
+    if return_full_pred:
+        return pred.sort_values(ascending=False), asof_used
     return pred.nlargest(TOP_K), asof_used
 
 
@@ -444,6 +456,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--asof", default=None, help="YYYY-MM-DD")
     ap.add_argument("--reset", action="store_true", help="重置账户")
+    ap.add_argument("--use-radar", action="store_true",
+                    help="从 memory.db 注入 radar 高置信长线候选, 并剔除 radar avoid 命中")
+    ap.add_argument("--radar-min-conf", type=float, default=0.6)
+    ap.add_argument("--radar-max", type=int, default=5,
+                    help="radar 候选最多占几个 slot")
+    ap.add_argument("--radar-min-half-life", type=int, default=24,
+                    help="半衰期低于此小时的 radar 候选不接入 (T+1 买入损耗)")
     args = ap.parse_args()
 
     if args.reset:
@@ -482,6 +501,28 @@ def main():
         print(f"  信号日: {sig_date.date()}, top {len(top)} 股均分打分")
     except Exception as e:
         print(f"❌ 信号生成失败: {e}"); return
+
+    # 可选: radar 事件注入 (在 buy 之前重排 top, ML 排名不变, 只换 index 顺序)
+    if args.use_radar:
+        try:
+            from llm_layer.radar_candidates import (
+                get_radar_long_candidates, get_radar_avoid_codes,
+                reorder_top_with_radar, log_injection_summary,
+            )
+            longs = get_radar_long_candidates(
+                min_conf=args.radar_min_conf,
+                top=args.radar_max,
+                min_half_life_hours=args.radar_min_half_life,
+            )
+            avoids = get_radar_avoid_codes(min_conf=args.radar_min_conf)
+            reordered, stats = reorder_top_with_radar(
+                list(top.index), longs, avoids, max_k=TOP_K,
+            )
+            log_injection_summary(longs, avoids, stats)
+            # 保留原始 score, 只重排 index
+            top = top.reindex(reordered).fillna(0.0)
+        except Exception as e:
+            print(f"⚠️  radar 注入失败, 用纯 ML top: {e}")
 
     # 执行一日流程
     print(f"\n[2/3] 执行 T+1 卖出到期 + 买入新信号...")

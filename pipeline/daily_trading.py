@@ -41,11 +41,15 @@ class DailyTradingPipeline:
         use_llm: bool = False,
         llm_backend: str = "mock",
         target_participation: float = 0.05,
+        use_radar: bool = False,
+        radar_since_hours: int = 72,
     ):
         self.top_k = top_k
         self.use_llm = use_llm
         self.llm_backend = llm_backend
         self.target_participation = target_participation
+        self.use_radar = use_radar
+        self.radar_since_hours = radar_since_hours
 
     def run(
         self,
@@ -109,8 +113,26 @@ class DailyTradingPipeline:
         try:
             from llm_layer import TradingAgentTeam
             team = TradingAgentTeam(backend=self.llm_backend, debate_rounds=1)
+
+            # 可选: 预构造 radar_summary 供 event_analyst 消费
+            build_summary = None
+            if self.use_radar:
+                try:
+                    from llm_layer.radar_events_helper import (
+                        build_radar_summary_for_code,
+                    )
+                    build_summary = build_radar_summary_for_code
+                except Exception as e:
+                    decision.notes.append(f"radar helper 不可用: {e}")
+
             for c in decision.candidates[: min(3, len(decision.candidates))]:
                 try:
+                    radar_summary = None
+                    if build_summary is not None:
+                        radar_summary = build_summary(
+                            c["code"], c.get("name", ""),
+                            since_hours=self.radar_since_hours,
+                        )
                     agent_dec = asyncio.run(team.decide_async(
                         code=c["code"], name=c["code"],
                         fundamentals="(自动生成, 实盘应拉 akshare 财报)",
@@ -127,9 +149,14 @@ class DailyTradingPipeline:
                                         "market_trend": "neutral",
                                         "money_effect": "neutral",
                                         "events": "无"},
+                        radar_summary=radar_summary,
                     ))
                     c["agent_action"] = agent_dec.action
                     c["agent_conviction"] = agent_dec.conviction
+                    if radar_summary:
+                        ev = agent_dec.analyst_views.get("event") or {}
+                        c["event_view"] = ev.get("view")
+                        c["event_score"] = ev.get("score")
                 except Exception as e:
                     c["agent_error"] = str(e)[:100]
         except Exception as e:

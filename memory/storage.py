@@ -27,7 +27,9 @@ from utils.logger import logger
 
 MemoryKind = Literal["reflection", "rule", "risk_lesson",
                      "fundamental", "technical", "sentiment",
-                     "trade", "market_event"]
+                     "trade", "market_event", "radar_event"]
+
+RADAR_EVENT = "radar_event"
 
 
 @dataclass
@@ -190,6 +192,110 @@ class MemoryStore:
     def delete(self, id: int):
         with self._conn() as c:
             c.execute("DELETE FROM memories WHERE id = ?", (id,))
+
+    # ---------- Radar 事件专用 (Stock Radar Chrome 扩展上行) ----------
+    def add_radar_events(self, events: list[dict]) -> int:
+        """批量写入 Radar 事件, 幂等按 source+raw_id 去重.
+
+        每条 event 预期结构:
+          { id, source, ts, code?, title, content?, tags, score, ... }
+        ts 允许毫秒或秒, 内部统一转秒存储.
+        """
+        if not events:
+            return 0
+        with self._conn() as c:
+            n = 0
+            for e in events:
+                src = e.get("source", "unknown")
+                raw_id = str(e.get("id", ""))
+                if not raw_id:
+                    continue
+                ts_raw = int(e.get("ts") or time.time() * 1000)
+                ts = ts_raw // 1000 if ts_raw > 10**11 else ts_raw
+                code = str(e.get("code") or "")
+                content = (e.get("title") or "")[:500]
+                meta = {
+                    "source": src,
+                    "radar_id": raw_id,
+                    "score": int(e.get("score") or 0),
+                    "tags": list(e.get("tags") or []),
+                    "url": e.get("url"),
+                    "raw": e,
+                }
+                # 幂等: 相同 source + radar_id 已存在则跳过
+                exists = c.execute(
+                    "SELECT id FROM memories WHERE kind=? "
+                    "AND json_extract(metadata_json,'$.radar_id')=? "
+                    "AND json_extract(metadata_json,'$.source')=? LIMIT 1",
+                    (RADAR_EVENT, raw_id, src),
+                ).fetchone()
+                if exists:
+                    continue
+                c.execute(
+                    "INSERT INTO memories(kind, ts, code, content, metadata_json) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (RADAR_EVENT, ts, code, content,
+                     json.dumps(meta, ensure_ascii=False)),
+                )
+                n += 1
+            return n
+
+    def query_radar_events(
+        self, since_ts: int | None = None, source: str | None = None,
+        min_score: int = 0, limit: int = 200,
+        needs_analysis: bool = False,
+    ) -> list[MemoryRecord]:
+        """查 Radar 事件, ts 秒级.
+
+        needs_analysis=True 时只返回 metadata.analysis 尚未写入的事件,
+        供 radar_worker 消费待分析队列.
+        """
+        sql = "SELECT * FROM memories WHERE kind=?"
+        params: list[Any] = [RADAR_EVENT]
+        if since_ts is not None:
+            sql += " AND ts >= ?"
+            params.append(since_ts)
+        if source:
+            sql += " AND json_extract(metadata_json,'$.source')=?"
+            params.append(source)
+        if min_score > 0:
+            sql += " AND CAST(json_extract(metadata_json,'$.score') AS INTEGER) >= ?"
+            params.append(min_score)
+        if needs_analysis:
+            sql += " AND json_extract(metadata_json,'$.analysis') IS NULL"
+        sql += " ORDER BY ts DESC LIMIT ?"
+        params.append(limit)
+        with self._conn() as c:
+            rows = c.execute(sql, params).fetchall()
+        return [self._row_to_record(r) for r in rows]
+
+    def update_memory_metadata(self, id: int, metadata: dict) -> None:
+        """整段覆盖 memory 的 metadata_json.
+
+        用于 radar_worker 把 analyst 产出的 analysis dict 写回事件.
+        调用方有义务先读出原 metadata 再 merge, 避免丢字段.
+        """
+        with self._conn() as c:
+            c.execute(
+                "UPDATE memories SET metadata_json = ? WHERE id = ?",
+                (json.dumps(metadata, ensure_ascii=False), id),
+            )
+
+    def radar_stats(self, since_ts: int) -> dict:
+        """Radar 事件自检: 分源计数 / 分档计数."""
+        with self._conn() as c:
+            total = c.execute(
+                "SELECT COUNT(*) FROM memories WHERE kind=? AND ts>=?",
+                (RADAR_EVENT, since_ts)).fetchone()[0]
+            by_source = dict(c.execute(
+                "SELECT json_extract(metadata_json,'$.source') AS s, COUNT(*) "
+                "FROM memories WHERE kind=? AND ts>=? GROUP BY s",
+                (RADAR_EVENT, since_ts)).fetchall())
+            high = c.execute(
+                "SELECT COUNT(*) FROM memories WHERE kind=? AND ts>=? "
+                "AND CAST(json_extract(metadata_json,'$.score') AS INTEGER) >= 60",
+                (RADAR_EVENT, since_ts)).fetchone()[0]
+        return {"total": total, "by_source": by_source, "high_score": high}
 
     def _row_to_record(self, row: sqlite3.Row) -> MemoryRecord:
         return MemoryRecord(

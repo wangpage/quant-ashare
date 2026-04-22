@@ -85,7 +85,8 @@ def test_prompt_format():
         "kline": "近30日均线上行", "factor_score": 0.42,
         "indicators": "RSI 65", "sentiment_data": "新闻中性",
         "fundamental_view": "bullish", "technical_view": "neutral",
-        "sentiment_view": "bearish",
+        "sentiment_view": "bearish", "event_view": "neutral: 无事件信号",
+        "radar_summary": "(测试)",
         "bull_prev": "多头立论...", "bear_attack": "空头攻击...",
         "bear_prev": "空头立论...", "bull_attack": "多头攻击...",
         "n_rounds": 2, "final_bull": "最终多头", "final_bear": "最终空头",
@@ -106,7 +107,8 @@ def test_prompt_format():
     }
     templates = [
         "FUNDAMENTAL_ANALYST_PROMPT", "TECHNICAL_ANALYST_PROMPT",
-        "SENTIMENT_ANALYST_PROMPT", "RESEARCHER_INITIAL_BULL_PROMPT",
+        "SENTIMENT_ANALYST_PROMPT", "EVENT_ANALYST_PROMPT",
+        "RESEARCHER_INITIAL_BULL_PROMPT",
         "RESEARCHER_INITIAL_BEAR_PROMPT", "RESEARCHER_BULL_REBUTTAL_PROMPT",
         "RESEARCHER_BEAR_REBUTTAL_PROMPT", "RESEARCHER_JUDGE_PROMPT",
         "TRADER_PROMPT", "RISK_MANAGER_PROMPT",

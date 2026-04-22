@@ -170,15 +170,53 @@ SENTIMENT_ANALYST_PROMPT = COMMON_HEADER + """
 """
 
 
+# ==================== 3.5 事件面分析师 (radar 事件传导) ====================
+EVENT_ANALYST_PROMPT = COMMON_HEADER + """
+任务: 针对股票 {code}({name}) 做事件面分析.
+你拿到的不是原始新闻, 而是 radar_worker 已经用 Opus 深度分析过的事件证据,
+你的职责是基于这些证据输出独立的交易视角 (bullish / bearish / neutral),
+作为多分析师辩论的第四路声音.
+
+=== 判断框架 ===
+1. 事件对该股的传导强度: 直接受益 / 供应链间接 / 题材擦边 / 无关
+2. 是否已 price-in: 看证据中的 already_priced_in 字段 + 结合事件发生时间
+3. 题材梯队位置: 该股是龙头? 补涨? 跟风? (若证据提到同题材其它标的)
+4. 信号一致性: 多条事件若都指向同方向, 加权; 相互矛盾则弱化
+5. 逆向指标: "某股连板 + 拥挤度警告" 这类组合倾向负分; "龙头已涨, 补涨股还在低位" 倾向正分
+
+=== 事件证据 (radar_worker 产出) ===
+{radar_summary}
+
+=== 输出 (严格按 XML 格式, 不要额外叙述) ===
+<THINKING>
+最多 3 行, 点出关键证据和权衡. 如果证据为空 / 无相关事件, 明确说"无事件信号".
+</THINKING>
+
+<REASONING>
+不超过 150 字, 解释 view 的依据. 引用具体证据 (比如 "20日位置 97% + already_priced_in=partial 说明已充分定价").
+</REASONING>
+
+<RISK>
+事件面特有风险 (如消息真实性待验证, 供应链传导失败, 题材一日游).
+</RISK>
+
+<SCORE>-1 到 1 之间的小数. 负看空, 正看多, 0 中性.</SCORE>
+<CONVICTION>0 到 1 之间. 证据越明确越高, 无证据时不要超过 0.3.</CONVICTION>
+<SOLUTION>bullish / neutral / bearish</SOLUTION>
+<EXPLANATION>一句话结论, 不超过 40 字.</EXPLANATION>
+"""
+
+
 # ==================== 4. 研究员 (Bull vs Bear 多轮辩论) ====================
 RESEARCHER_INITIAL_BULL_PROMPT = COMMON_HEADER + """
-任务: 针对股票 {code}, 你是多头. 基于三位分析师的观点, 给出看多论点.
+任务: 针对股票 {code}, 你是多头. 基于四位分析师的观点, 给出看多论点.
 
 基本面分析师: {fundamental_view}
 技术面分析师: {technical_view}
 情绪面分析师: {sentiment_view}
+事件面分析师: {event_view}
 
-<THINKING>找出三方观点中最支持做多的证据链.</THINKING>
+<THINKING>找出四方观点中最支持做多的证据链. 事件面如果无信号, 按三方处理.</THINKING>
 <REASONING>
 论点1:
 论点2:
@@ -190,13 +228,14 @@ RESEARCHER_INITIAL_BULL_PROMPT = COMMON_HEADER + """
 """
 
 RESEARCHER_INITIAL_BEAR_PROMPT = COMMON_HEADER + """
-任务: 针对股票 {code}, 你是空头. 基于三位分析师的观点, 给出看空论点.
+任务: 针对股票 {code}, 你是空头. 基于四位分析师的观点, 给出看空论点.
 
 基本面分析师: {fundamental_view}
 技术面分析师: {technical_view}
 情绪面分析师: {sentiment_view}
+事件面分析师: {event_view}
 
-<THINKING>找出三方观点中最支持做空或观望的证据链.</THINKING>
+<THINKING>找出四方观点中最支持做空或观望的证据链. 事件面若提示 price-in 或题材拥挤, 是有力空头论据.</THINKING>
 <REASONING>
 论点1:
 论点2:

@@ -1,9 +1,15 @@
 #!/bin/bash
-# 一键安装 crontab: A股 paper trade 每日自动化
+# 一键安装 crontab: A股 paper trade 每日自动化 + radar 事件分析链路
 #
 # 安装内容:
 #   • 每交易日 15:30  → 数据更新 + paper trade + 飞书通知 + git push
 #   • 每周日 20:00    → leak detector 自检
+#   • 交易时段每 5 分钟 → radar_worker --once (消费扩展上行的事件, 写 analysis)
+#   • 12:01 / 14:33 / 15:37 → radar 简报飞书推送 (盘中 x2 + 盘后 x1)
+#
+# 注: radar_worker 用 cron 每 5 分钟触发是"穷人版 daemon". 想要低延迟
+# (<30s 响应), 把 */5 那行注释掉, 改用:
+#   nohup python scripts/radar_worker.py > logs/radar_worker.log 2>&1 &
 #
 # 用法:
 #   bash scripts/install_cron.sh           # 交互安装
@@ -35,6 +41,12 @@ PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin
 30 15 * * 1-5 cd "$PROJECT_DIR" && $PYTHON_BIN scripts/cron_daily.py >> logs/cron_last.log 2>&1
 # 每周日 20:00: leak detector 回归
 0 20 * * 0 cd "$PROJECT_DIR" && $PYTHON_BIN scripts/cron_daily.py --leak-check >> logs/cron_last.log 2>&1
+# 交易时段每 5 分钟: radar_worker 消费待分析事件(穷人版 daemon)
+*/5 9-15 * * 1-5 cd "$PROJECT_DIR" && $PYTHON_BIN scripts/radar_worker.py --once --limit 30 --deep-budget 5 --since-hours 3 >> logs/radar_worker.log 2>&1
+# Radar 情报简报: 盘中午休前 + 尾盘前 + 盘后(错开整点避免 API 拥挤)
+1 12 * * 1-5 cd "$PROJECT_DIR" && $PYTHON_BIN scripts/radar_briefing.py --title-prefix "[盘中]" --hours 3 --min-conf 0.5 >> logs/radar_briefing.log 2>&1
+33 14 * * 1-5 cd "$PROJECT_DIR" && $PYTHON_BIN scripts/radar_briefing.py --title-prefix "[盘中]" --hours 2 --min-conf 0.5 >> logs/radar_briefing.log 2>&1
+37 15 * * 1-5 cd "$PROJECT_DIR" && $PYTHON_BIN scripts/radar_briefing.py --title-prefix "[盘后]" --min-conf 0.5 >> logs/radar_briefing.log 2>&1
 $MARKER-end
 EOF
 }
