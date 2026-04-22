@@ -35,6 +35,7 @@ if env.exists():
             os.environ.setdefault(k.strip(), v.strip())
 
 ROOT = Path(__file__).resolve().parent.parent
+LARK_BIN = "/opt/homebrew/bin/lark-cli"
 CACHE = ROOT / "cache"
 PAPER = ROOT / "output" / "paper_trade"
 
@@ -193,10 +194,11 @@ def build_report(decisions: list[dict], date_str: str, mode: str) -> str:
 def send_lark(md: str) -> bool:
     user_id = os.environ.get("LARK_USER_OPEN_ID",
                               "ou_5be0f87dc7cec796b7ea97d0a9b5302f")
-    cmd = ["lark-cli", "im", "+messages-send",
+    cmd = [str(LARK_BIN), "im", "+messages-send",
            "--as", "user", "--user-id", user_id, "--markdown", md]
     try:
-        rc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        env = {**os.environ, "PATH": f"/opt/homebrew/bin:{os.environ.get('PATH', '/usr/local/bin:/usr/bin:/bin')}"}
+        rc = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=env)
         if rc.returncode == 0:
             print("✓ 飞书已送达")
             return True

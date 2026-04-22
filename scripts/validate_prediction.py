@@ -27,6 +27,7 @@ import numpy as np
 from scipy.stats import spearmanr
 
 ROOT = Path(__file__).resolve().parent.parent
+LARK_BIN = "/opt/homebrew/bin/lark-cli"
 
 env = ROOT / ".env"
 if env.exists():
@@ -44,11 +45,12 @@ def send_lark(markdown: str) -> bool:
     """推送 markdown 消息到飞书."""
     user_id = os.environ.get("LARK_USER_OPEN_ID",
                               "ou_5be0f87dc7cec796b7ea97d0a9b5302f")
-    cmd = ["lark-cli", "im", "+messages-send",
+    cmd = [str(LARK_BIN), "im", "+messages-send",
            "--as", "user", "--user-id", user_id,
            "--markdown", markdown]
     try:
-        rc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        env = {**os.environ, "PATH": f"/opt/homebrew/bin:{os.environ.get('PATH', '/usr/local/bin:/usr/bin:/bin')}"}
+        rc = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=env)
         if rc.returncode == 0:
             print("✓ 飞书已送达")
             return True
