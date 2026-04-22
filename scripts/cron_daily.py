@@ -3,9 +3,11 @@
 流程:
     1. 跑 daily_data_updater (失败不阻塞, 警告后继续)
     2. 跑 paper_trade_runner
-    3. 读 account.json 生成汇报 markdown
+    3. 跑 watchlist_signal (专业量化信号, 内部独立推飞书)
     4. git add/commit/push paper_trade 输出
-    5. lark-cli 推送到飞书
+    5. 读 account.json 生成账户汇报并推送
+    6. 分析师简报 (市场全景 + 明日 Top N + 昨日命中 + 风险提示)
+    7. 批量扫描 (246 只候选池 全因子打分 + LLM Top20+Bottom10 推荐/回避)
 
 用法:
     python3 scripts/cron_daily.py                     # 正常模式
@@ -190,7 +192,7 @@ def main_daily(args):
 
         # 1. 数据更新
         if not args.skip_data:
-            log("\n── 1/5 数据增量更新 ──", logfile)
+            log("\n── 1/7 数据增量更新 ──", logfile)
             rc, out = run_cmd(
                 ["python3", "scripts/daily_data_updater.py"],
                 logfile, timeout=1800,
@@ -198,10 +200,13 @@ def main_daily(args):
             if rc != 0:
                 log(f"⚠️  data updater 失败 (rc={rc}), 继续用旧缓存", logfile)
 
-        # 2. paper trade
-        log("\n── 2/5 Paper Trade Runner ──", logfile)
+        # 2. paper trade (可选注入 radar 候选)
+        log("\n── 2/7 Paper Trade Runner ──", logfile)
+        pt_cmd = ["python3", "scripts/paper_trade_runner.py"]
+        if args.use_radar:
+            pt_cmd += ["--use-radar"]
         rc, out = run_cmd(
-            ["python3", "scripts/paper_trade_runner.py"],
+            pt_cmd,
             logfile, timeout=1200,
         )
         if rc != 0:
@@ -211,7 +216,7 @@ def main_daily(args):
             # paper trade 失败不阻断 watchlist signal, 继续
 
         # 3. watchlist signal (专业买卖信号, 独立于 paper trade)
-        log("\n── 3/5 Watchlist 量化信号 ──", logfile)
+        log("\n── 3/7 Watchlist 量化信号 ──", logfile)
         ws_cmd = ["python3", "scripts/watchlist_signal.py"]
         if args.dry_run_lark:
             ws_cmd.append("--dry-run-lark")
@@ -223,14 +228,14 @@ def main_daily(args):
         # watchlist_signal.py 内部会自己发飞书, 这里不重复发
 
         # 4. git push
-        log("\n── 4/5 Git Commit + Push ──", logfile)
+        log("\n── 4/7 Git Commit + Push ──", logfile)
         if not args.skip_push:
             ok = git_commit_push(logfile, dry_run=False)
             if not ok:
                 log(f"⚠️  git push 失败", logfile)
 
         # 5. paper trade 账户通知 (和 watchlist 分开, 两条不同视角)
-        log("\n── 5/5 Paper Trade 账户通知 ──", logfile)
+        log("\n── 5/7 Paper Trade 账户通知 ──", logfile)
         account_path = PAPER / "account.json"
         if account_path.exists():
             acc = json.loads(account_path.read_text(encoding="utf-8"))
@@ -238,6 +243,46 @@ def main_daily(args):
             send_lark(report, user_id, args.dry_run_lark)
         else:
             log(f"⚠️  无 account.json, 跳过账户通知", logfile)
+
+        # 6. 分析师简报 (盘后综合: 市场全景 + 明日 Top N + 昨日命中 + 风险提示)
+        # run_cmd 的 cwd=ROOT, 所以 -m notifier.dispatch 能直接找到包
+        log("\n── 6/7 分析师简报推送 ──", logfile)
+        analyst_cmd = [
+            "python3", "-m", "notifier.dispatch",
+            "--date", datetime.now().strftime("%Y-%m-%d"),
+            "--user-id", user_id,
+        ]
+        if args.dry_run_lark:
+            analyst_cmd.append("--dry-run")
+        rc_an, out_an = run_cmd(analyst_cmd, logfile, timeout=600)
+        if rc_an == 10:
+            log("⚠️  分析师层 auth 过期, 已跳过 (cron 主流程不受影响)", logfile)
+        elif rc_an != 0:
+            log(f"⚠️  分析师层异常 rc={rc_an}", logfile)
+            send_lark(build_error_report("analyst_dispatch", out_an),
+                       user_id, args.dry_run_lark)
+        else:
+            log("✓ 分析师简报已推送", logfile)
+
+        # 7. 批量扫描 (246 只候选池 全因子打分 + LLM Top20+Bottom10)
+        log("\n── 7/7 批量扫描推送 ──", logfile)
+        batch_cmd = [
+            "python3", "scripts/batch_scan.py",
+            "--top", "20", "--bottom", "10",
+            "--user-id", user_id,
+        ]
+        if args.dry_run_lark:
+            batch_cmd.append("--dry-run")
+        # LLM 30 次 + 数据拉取 + 因子, 最多 10 分钟
+        rc_bs, out_bs = run_cmd(batch_cmd, logfile, timeout=900)
+        if rc_bs == 10:
+            log("⚠️  批量扫描 auth 过期, 已跳过", logfile)
+        elif rc_bs != 0:
+            log(f"⚠️  批量扫描异常 rc={rc_bs}", logfile)
+            send_lark(build_error_report("batch_scan", out_bs),
+                       user_id, args.dry_run_lark)
+        else:
+            log("✓ 批量扫描已推送", logfile)
 
         log(f"\n✅ Cron daily 完成 @ {datetime.now().strftime('%H:%M:%S')}", logfile)
         return 0
@@ -278,6 +323,8 @@ if __name__ == "__main__":
     ap.add_argument("--dry-run-lark", action="store_true", help="不发飞书")
     ap.add_argument("--leak-check", action="store_true", help="跑 leak detector 模式")
     ap.add_argument("--test-notify", action="store_true", help="只测飞书通道")
+    ap.add_argument("--use-radar", action="store_true",
+                    help="paper_trade 注入 radar 高置信候选 (需要 radar_worker 已跑)")
     args = ap.parse_args()
 
     if args.test_notify:

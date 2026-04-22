@@ -226,6 +226,8 @@ quant-ashare/
 ├── llm_layer/                # Hermes XML + 多智能体
 ├── risk/                     # A股风控
 ├── level2/                   # NATS Level2 接入
+├── analyst/              ⭐ 分析师推送层 (市场全景 + 因子聚合 → 飞书简报)
+├── notifier/             ⭐ 飞书推送统一出口 (subprocess 封 lark-cli)
 ├── scripts/                  # 一键脚本
 ├── tests/                    # 219 测试用例
 └── ADVANCED_TRICKS.md    ⭐ 15 个圈内 tricks 详解
@@ -267,58 +269,74 @@ test_* 函数总数: 46 个
 
 ## 🔔 每日自动化 (Cron + 飞书通知)
 
-**三件套**(每日 15:30 自动跑,3 分钟完成):
+**7 步流水线**(每日 15:30 自动跑,约 5-8 分钟完成, 见 [scripts/cron_daily.py](scripts/cron_daily.py)):
 
-1. **[scripts/cron_daily.py](scripts/cron_daily.py)**: 编排器
-   - 数据增量(daily_data_updater) → Paper Trade(paper_trade_runner) → **Watchlist 信号**(watchlist_signal) → Git push → 飞书通知
-   - 任一环节失败会发错误告警到飞书
+```
+1/7 数据增量更新     (daily_data_updater.py)
+2/7 Paper Trade     (paper_trade_runner.py)
+3/7 Watchlist 信号   (watchlist_signal.py  ← 自选池 7 因子)
+4/7 Git Commit/Push (同步 paper trade 产物到 GitHub)
+5/7 账户通知         → 飞书 IM (NAV + 持仓 + 当日 P&L)
+6/7 分析师简报       → 飞书 IM (市场全景 + 明日 Top3 + 昨日命中 + 风险)
+7/7 批量扫描         → 飞书 IM (246 只候选池 + LLM Top20/Bottom10 推荐/回避)
+```
 
-   **[scripts/watchlist_signal.py](scripts/watchlist_signal.py)**: 自选池专业信号(独立于 paper trade 账户)
-   - Universe: [config/user_watchlist.yaml](config/user_watchlist.yaml) (63 只半导体/军工/新材料/稀金)
-   - 7 因子合成: REV_5/REV_20/MOM_126_21/LOW_VOL_60/TURN_Z_60/MAX_RET_5/AMIHUD_60
-   - 输出分级: 🟩强买入 (z≥1.5) / 🟢买入 (0.75-1.5) / 🟡减仓 / 🟥清仓
-   - 带建议仓位% + 参考股数(按 100 万资金)+ 因子主导维度
-   - 飞书消息样例:
-     ```
-     ⚡ 量化 Alpha 信号 — 2026-04-21
-     Universe: 63 只自选池 | 参考资金 ¥100 万
-     截面: z中位 +0.14  强正 14  强负 12
+任一环节失败会发错误告警到飞书,不阻塞后续步骤.
 
-     🟩 强买入
-       • 中航西飞 ¥24.79  z=+1.57  建议 4%仓 ≈ 1600 股  [+REV_5]
-       • 中国中铁 ¥5.30   z=+1.54  建议 4%仓 ≈ 7600 股  [+REV_20]
+### 推送内容差异
 
-     🟢 买入
-       • 中国重汽 ¥23.59  z=+1.47  建议 3%仓 ≈ 1200 股  [+REV_5]
-       ...
-     🟥 清仓
-       • 云南锗业 ¥68.20  z=-1.96  [-REV_5]
-       ...
-     ```
+| 步骤 | 目标 | 内容 |
+|---|---|---|
+| 5/7 账户通知 | 自我复盘 | NAV / 累计收益 / 当日 P&L / Top 5 持仓 |
+| 6/7 分析师简报 | 明日决策(自选池) | 上证/深证/创业板涨跌 · 板块 Top5 · 昨日 IC · 自选池精选 Top3 + 止损止盈 + 风险点 |
+| 7/7 批量扫描 | 全池排序(246 只) | 🟩推荐/🟢关注/⚪中性/🟡谨慎/🟥不推荐 桶化 · 量化 Top10+Bottom5 · LLM 精分析 Top20+Bottom10 |
 
-2. **[scripts/install_cron.sh](scripts/install_cron.sh)**: 一键安装 crontab
+### 核心脚本
+
+- **[scripts/cron_daily.py](scripts/cron_daily.py)**: 7 步编排器, 支持 `--dry-run-lark` / `--skip-data` / `--skip-push` / `--test-notify` / `--leak-check` 各种调试模式
+- **[scripts/watchlist_signal_v2.py](scripts/watchlist_signal_v2.py)**: 自选池 18 因子信号(反转 + 打板 + 席位 + 板块)
+- **[scripts/batch_scan.py](scripts/batch_scan.py)**: 任意股票池扩池扫描
+  ```bash
+  python3 scripts/batch_scan.py                              # 默认 股票名称_代码.csv
+  python3 scripts/batch_scan.py --codes-csv /path/to/pool.csv
+  python3 scripts/batch_scan.py --top 20 --bottom 10         # LLM 精分析数量
+  python3 scripts/batch_scan.py --no-llm                     # 纯量化模式
+  ```
+- **[notifier/dispatch.py](notifier/dispatch.py)**: 分析师简报推送入口
+  ```bash
+  python3 -m notifier.dispatch --date 2026-04-22             # 今日简报
+  python3 -m notifier.dispatch --date 2026-04-22 --dry-run   # 不发飞书, 打印 Markdown
+  ```
+
+### 安装 cron
+
+```bash
+bash scripts/install_cron.sh              # 安装
+bash scripts/install_cron.sh --dry-run    # 预览
+bash scripts/install_cron.sh --uninstall  # 卸载
+```
+
+默认配置: 交易日 15:30 跑全流水线; 周日 20:00 跑 leak detector 自检.
+
+### 飞书推送 - 身份配置
+
+**重要**: 飞书不允许 `user` 身份给自己的 open_id 发 P2P 消息(API 成功但客户端不显示). 必须用 `bot` 身份(即自建应用机器人, 如本项目配的 `cccli`).
+
+配置步骤:
+1. 飞书开放平台 [open.feishu.cn](https://open.feishu.cn) 建自建应用(例如 `cccli`), 开通 `im:message` 权限
+2. 在飞书客户端添加这个机器人为好友
+3. 本地装 [lark-cli](https://github.com/larksuite/lark-cli)
    ```bash
-   bash scripts/install_cron.sh         # 安装
-   bash scripts/install_cron.sh --dry-run
-   bash scripts/install_cron.sh --uninstall
+   lark-cli config init       # 填 app_id / app_secret
+   lark-cli auth login        # user 身份登录(交互式)
+   lark-cli auth status       # 确认 valid
    ```
-   默认配置:
-   - 交易日 15:30 → 数据更新 + paper trade + 飞书通知
-   - 周日 20:00 → leak detector 自检(如果回测管道被破立刻告警)
-
-3. **飞书通知示例**:
-   ```
-   📊 A股 Paper Trade 2026-04-21
-   • NAV: ¥123.1 万 (初始 ¥100 万)
-   • 累计: +23.06%  持仓 25 只
-   • 当日 P&L: ¥+47099
-   Top 5 持仓: #1 600683, #2 003018, ...
+4. 设置推送目标(环境变量覆盖默认值):
+   ```bash
+   export LARK_USER_OPEN_ID=ou_xxxxx
    ```
 
-**依赖**:
-- [lark-cli](https://github.com/larksuite/lark-cli) (飞书发消息)
-- 首次用 `lark-cli auth login` 授权,开机 open_id 自动查
-- 环境变量可覆盖:`LARK_USER_OPEN_ID=ou_xxxxx`
+**为什么用 `--as bot`**: lark-cli 在 user 身份下给自己的 open_id 发消息, 飞书客户端不展示; 改 `--as bot` 后消息以"机器人推送"形式出现在正常 IM 列表里. [notifier/feishu_client.py](notifier/feishu_client.py) 默认 `as_user=False`, 遇到 auth 过期返回 exit 10 让 cron 打标但不阻塞.
 
 ---
 
