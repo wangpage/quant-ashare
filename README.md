@@ -222,14 +222,18 @@ quant-ashare/
 ├── execution/             ⭐ TWAP/VWAP + 冲击感知 + 时段避让
 ├── pipeline/              ⭐ 研究 + 实盘端到端
 ├── market_regime/            # 8 种市场状态分类器
-├── memory/                   # 交易记忆 + Skill Factory
-├── llm_layer/                # Hermes XML + 多智能体
+├── memory/                   # 交易记忆 + Skill Factory + radar 事件存储
+├── llm_layer/                # Hermes XML + 多智能体 + radar analyst (Haiku+Opus)
 ├── risk/                     # A股风控
 ├── level2/                   # NATS Level2 接入
+├── thematic_investing/       # 主题投资识别 (萌芽/扩散/拥挤)
 ├── analyst/              ⭐ 分析师推送层 (市场全景 + 因子聚合 → 飞书简报)
-├── notifier/             ⭐ 飞书推送统一出口 (subprocess 封 lark-cli)
-├── scripts/                  # 一键脚本
-├── tests/                    # 219 测试用例
+├── notifier/             ⭐ 飞书推送统一出口 (subprocess 封 lark-cli, bot 身份)
+├── webapp/                   # Streamlit 4 页可视化
+├── utils/                    # 配置加载 + 日志封装
+├── scripts/                  # 一键脚本 (cron_daily / batch_scan / radar_* 等)
+├── tests/                    # 测试用例
+├── api_server.py         ⭐ FastAPI 9876 (Stock Radar 扩展事件上报入口)
 └── ADVANCED_TRICKS.md    ⭐ 15 个圈内 tricks 详解
 ```
 
